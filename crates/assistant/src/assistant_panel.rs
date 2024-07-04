@@ -1,44 +1,52 @@
+use crate::slash_command::docs_command::{DocsSlashCommand, DocsSlashCommandArgs};
 use crate::{
     assistant_settings::{AssistantDockPosition, AssistantSettings},
+    humanize_token_count,
     prompt_library::open_prompt_library,
     search::*,
     slash_command::{
         default_command::DefaultSlashCommand, SlashCommandCompletionProvider, SlashCommandLine,
         SlashCommandRegistry,
     },
+    terminal_inline_assistant::TerminalInlineAssistant,
     ApplyEdit, Assist, CompletionProvider, ConfirmCommand, ContextStore, CycleMessageRole,
-    InlineAssist, InlineAssistant, LanguageModelRequest, LanguageModelRequestMessage, MessageId,
-    MessageMetadata, MessageStatus, ModelSelector, QuoteSelection, ResetKey, Role, SavedContext,
-    SavedContextMetadata, SavedMessage, Split, ToggleFocus, ToggleHistory, ToggleModelSelector,
+    InlineAssist, InlineAssistant, InsertIntoEditor, LanguageModelRequest,
+    LanguageModelRequestMessage, MessageId, MessageMetadata, MessageStatus, ModelSelector,
+    QuoteSelection, ResetKey, Role, SavedContext, SavedContextMetadata, SavedMessage, Split,
+    ToggleFocus, ToggleHistory, ToggleModelSelector,
 };
 use anyhow::{anyhow, Result};
 use assistant_slash_command::{SlashCommand, SlashCommandOutput, SlashCommandOutputSection};
 use client::telemetry::Telemetry;
 use collections::{BTreeSet, HashMap, HashSet};
-use editor::actions::ShowCompletions;
 use editor::{
-    actions::{FoldAt, MoveToEndOfLine, Newline, UnfoldAt},
-    display_map::{BlockDisposition, BlockId, BlockProperties, BlockStyle, Flap, ToDisplayPoint},
+    actions::{FoldAt, MoveToEndOfLine, Newline, ShowCompletions, UnfoldAt},
+    display_map::{
+        BlockDisposition, BlockId, BlockProperties, BlockStyle, Crease, RenderBlock, ToDisplayPoint,
+    },
     scroll::{Autoscroll, AutoscrollStrategy},
     Anchor, Editor, EditorEvent, RowExt, ToOffset as _, ToPoint,
 };
-use editor::{display_map::FlapId, FoldPlaceholder};
+use editor::{display_map::CreaseId, FoldPlaceholder};
 use file_icons::FileIcons;
 use fs::Fs;
 use futures::future::Shared;
 use futures::{FutureExt, StreamExt};
 use gpui::{
-    div, point, rems, Action, AnyElement, AnyView, AppContext, AsyncAppContext, AsyncWindowContext,
-    ClipboardItem, Context as _, Empty, EventEmitter, FocusHandle, FocusableView,
-    InteractiveElement, IntoElement, Model, ModelContext, ParentElement, Pixels, Render,
-    SharedString, StatefulInteractiveElement, Styled, Subscription, Task, UpdateGlobal, View,
-    ViewContext, VisualContext, WeakView, WindowContext,
+    div, percentage, point, rems, Action, Animation, AnimationExt, AnyElement, AnyView, AppContext,
+    AsyncAppContext, AsyncWindowContext, ClipboardItem, Context as _, Empty, EventEmitter,
+    FocusHandle, FocusOutEvent, FocusableView, InteractiveElement, IntoElement, Model,
+    ModelContext, ParentElement, Pixels, Render, SharedString, StatefulInteractiveElement, Styled,
+    Subscription, Task, Transformation, UpdateGlobal, View, ViewContext, VisualContext, WeakView,
+    WindowContext,
 };
+use indexed_docs::IndexedDocsStore;
 use language::{
-    language_settings::SoftWrap, AnchorRangeExt, AutoindentMode, Buffer, LanguageRegistry,
+    language_settings::SoftWrap, AnchorRangeExt as _, AutoindentMode, Buffer, LanguageRegistry,
     LspAdapterDelegate, OffsetRangeExt as _, Point, ToOffset as _,
 };
 use multi_buffer::MultiBufferRow;
+use paths::contexts_dir;
 use picker::{Picker, PickerDelegate};
 use project::{Project, ProjectLspAdapterDelegate, ProjectTransaction};
 use search::{buffer_search::DivRegistrar, BufferSearchBar};
@@ -53,11 +61,12 @@ use std::{
     time::{Duration, Instant},
 };
 use telemetry_events::AssistantKind;
+use terminal_view::{terminal_panel::TerminalPanel, TerminalView};
 use ui::{
-    popover_menu, prelude::*, ButtonLike, ContextMenu, ElevationIndex, KeyBinding, ListItem,
-    ListItemSpacing, PopoverMenuHandle, Tab, TabBar, Tooltip,
+    prelude::*, ButtonLike, ContextMenu, Disclosure, ElevationIndex, KeyBinding, ListItem,
+    ListItemSpacing, PopoverMenu, PopoverMenuHandle, Tab, TabBar, Tooltip,
 };
-use util::{paths::CONTEXTS_DIR, post_inc, ResultExt, TryFutureExt};
+use util::{post_inc, ResultExt, TryFutureExt};
 use uuid::Uuid;
 use workspace::NewFile;
 use workspace::{
@@ -79,11 +88,15 @@ pub fn init(cx: &mut AppContext) {
                     workspace.toggle_panel_focus::<AssistantPanel>(cx);
                 })
                 .register_action(AssistantPanel::inline_assist)
-                .register_action(AssistantPanel::cancel_last_inline_assist)
-                .register_action(ContextEditor::quote_selection);
+                .register_action(ContextEditor::quote_selection)
+                .register_action(ContextEditor::insert_selection);
         },
     )
     .detach();
+}
+
+pub enum AssistantPanelEvent {
+    ContextEdited,
 }
 
 pub struct AssistantPanel {
@@ -114,6 +127,11 @@ struct SavedContextPickerDelegate {
 
 enum SavedContextPickerEvent {
     Confirmed { path: PathBuf },
+}
+
+enum InlineAssistTarget {
+    Editor(View<Editor>, bool),
+    Terminal(View<TerminalView>),
 }
 
 impl EventEmitter<SavedContextPickerEvent> for Picker<SavedContextPickerDelegate> {}
@@ -297,7 +315,7 @@ impl AssistantPanel {
         }
     }
 
-    fn focus_out(&mut self, cx: &mut ViewContext<Self>) {
+    fn focus_out(&mut self, _event: FocusOutEvent, cx: &mut ViewContext<Self>) {
         self.toolbar
             .update(cx, |toolbar, cx| toolbar.focus_changed(false, cx));
         cx.notify();
@@ -357,57 +375,72 @@ impl AssistantPanel {
             return;
         }
 
-        let Some(assistant) = workspace.panel::<AssistantPanel>(cx) else {
+        let Some(assistant_panel) = workspace.panel::<AssistantPanel>(cx) else {
             return;
         };
 
-        let context_editor = assistant
-            .read(cx)
-            .active_context_editor()
-            .and_then(|editor| {
-                let editor = &editor.read(cx).editor;
-                if editor.read(cx).is_focused(cx) {
-                    Some(editor.clone())
-                } else {
-                    None
+        let Some(inline_assist_target) =
+            Self::resolve_inline_assist_target(workspace, &assistant_panel, cx)
+        else {
+            return;
+        };
+
+        if assistant_panel.update(cx, |assistant, cx| assistant.is_authenticated(cx)) {
+            match inline_assist_target {
+                InlineAssistTarget::Editor(active_editor, include_context) => {
+                    InlineAssistant::update_global(cx, |assistant, cx| {
+                        assistant.assist(
+                            &active_editor,
+                            Some(cx.view().downgrade()),
+                            include_context.then_some(&assistant_panel),
+                            cx,
+                        )
+                    })
                 }
-            });
-
-        let include_context;
-        let active_editor;
-        if let Some(context_editor) = context_editor {
-            active_editor = context_editor;
-            include_context = false;
-        } else if let Some(workspace_editor) = workspace
-            .active_item(cx)
-            .and_then(|item| item.act_as::<Editor>(cx))
-        {
-            active_editor = workspace_editor;
-            include_context = true;
+                InlineAssistTarget::Terminal(active_terminal) => {
+                    TerminalInlineAssistant::update_global(cx, |assistant, cx| {
+                        assistant.assist(
+                            &active_terminal,
+                            Some(cx.view().downgrade()),
+                            Some(&assistant_panel),
+                            cx,
+                        )
+                    })
+                }
+            }
         } else {
-            return;
-        };
-
-        if assistant.update(cx, |assistant, cx| assistant.is_authenticated(cx)) {
-            InlineAssistant::update_global(cx, |assistant, cx| {
-                assistant.assist(
-                    &active_editor,
-                    Some(cx.view().downgrade()),
-                    include_context,
-                    cx,
-                )
-            })
-        } else {
-            let assistant = assistant.downgrade();
+            let assistant_panel = assistant_panel.downgrade();
             cx.spawn(|workspace, mut cx| async move {
-                assistant
+                assistant_panel
                     .update(&mut cx, |assistant, cx| assistant.authenticate(cx))?
                     .await?;
-                if assistant.update(&mut cx, |assistant, cx| assistant.is_authenticated(cx))? {
-                    cx.update(|cx| {
-                        InlineAssistant::update_global(cx, |assistant, cx| {
-                            assistant.assist(&active_editor, Some(workspace), include_context, cx)
-                        })
+                if assistant_panel.update(&mut cx, |panel, cx| panel.is_authenticated(cx))? {
+                    cx.update(|cx| match inline_assist_target {
+                        InlineAssistTarget::Editor(active_editor, include_context) => {
+                            let assistant_panel = if include_context {
+                                assistant_panel.upgrade()
+                            } else {
+                                None
+                            };
+                            InlineAssistant::update_global(cx, |assistant, cx| {
+                                assistant.assist(
+                                    &active_editor,
+                                    Some(workspace),
+                                    assistant_panel.as_ref(),
+                                    cx,
+                                )
+                            })
+                        }
+                        InlineAssistTarget::Terminal(active_terminal) => {
+                            TerminalInlineAssistant::update_global(cx, |assistant, cx| {
+                                assistant.assist(
+                                    &active_terminal,
+                                    Some(workspace),
+                                    assistant_panel.upgrade().as_ref(),
+                                    cx,
+                                )
+                            })
+                        }
                     })?
                 } else {
                     workspace.update(&mut cx, |workspace, cx| {
@@ -421,16 +454,54 @@ impl AssistantPanel {
         }
     }
 
-    fn cancel_last_inline_assist(
-        _workspace: &mut Workspace,
-        _: &editor::actions::Cancel,
-        cx: &mut ViewContext<Workspace>,
-    ) {
-        let canceled = InlineAssistant::update_global(cx, |assistant, cx| {
-            assistant.cancel_last_inline_assist(cx)
-        });
-        if !canceled {
-            cx.propagate();
+    fn resolve_inline_assist_target(
+        workspace: &mut Workspace,
+        assistant_panel: &View<AssistantPanel>,
+        cx: &mut WindowContext,
+    ) -> Option<InlineAssistTarget> {
+        if let Some(terminal_panel) = workspace.panel::<TerminalPanel>(cx) {
+            if terminal_panel
+                .read(cx)
+                .focus_handle(cx)
+                .contains_focused(cx)
+            {
+                use feature_flags::FeatureFlagAppExt;
+                if !cx.has_flag::<feature_flags::TerminalInlineAssist>() {
+                    return None;
+                }
+
+                if let Some(terminal_view) = terminal_panel
+                    .read(cx)
+                    .pane()
+                    .read(cx)
+                    .active_item()
+                    .and_then(|t| t.downcast::<TerminalView>())
+                {
+                    return Some(InlineAssistTarget::Terminal(terminal_view));
+                }
+            }
+        }
+        let context_editor = assistant_panel
+            .read(cx)
+            .active_context_editor()
+            .and_then(|editor| {
+                let editor = &editor.read(cx).editor;
+                if editor.read(cx).is_focused(cx) {
+                    Some(editor.clone())
+                } else {
+                    None
+                }
+            });
+
+        if let Some(context_editor) = context_editor {
+            Some(InlineAssistTarget::Editor(context_editor, false))
+        } else if let Some(workspace_editor) = workspace
+            .active_item(cx)
+            .and_then(|item| item.act_as::<Editor>(cx))
+        {
+            Some(InlineAssistTarget::Editor(workspace_editor, true))
+        } else {
+            None
         }
     }
 
@@ -470,7 +541,7 @@ impl AssistantPanel {
             _subscriptions: subscriptions,
         });
         self.show_saved_contexts = false;
-
+        cx.emit(AssistantPanelEvent::ContextEdited);
         cx.notify();
     }
 
@@ -482,6 +553,7 @@ impl AssistantPanel {
     ) {
         match event {
             ContextEditorEvent::TabContentChanged => cx.notify(),
+            ContextEditorEvent::Edited => cx.emit(AssistantPanelEvent::ContextEdited),
         }
     }
 
@@ -590,7 +662,7 @@ impl AssistantPanel {
     fn render_popover_button(&self, cx: &mut ViewContext<Self>) -> impl IntoElement {
         let assistant = cx.view().clone();
         let zoomed = self.zoomed;
-        popover_menu("assistant-popover")
+        PopoverMenu::new("assistant-popover")
             .trigger(IconButton::new("trigger", IconName::Menu))
             .menu(move |cx| {
                 let assistant = assistant.clone();
@@ -632,7 +704,7 @@ impl AssistantPanel {
             )
         });
 
-        popover_menu("inject-context-menu")
+        PopoverMenu::new("inject-context-menu")
             .trigger(IconButton::new("trigger", IconName::Quote).tooltip(|cx| {
                 Tooltip::with_meta("Insert Context", None, "Type / to insert via keyboard", cx)
             }))
@@ -873,18 +945,33 @@ impl AssistantPanel {
         context: &Model<Context>,
         cx: &mut ViewContext<Self>,
     ) -> Option<impl IntoElement> {
-        let remaining_tokens = context.read(cx).remaining_tokens(cx)?;
-        let remaining_tokens_color = if remaining_tokens <= 0 {
+        let model = CompletionProvider::global(cx).model();
+        let token_count = context.read(cx).token_count()?;
+        let max_token_count = model.max_token_count();
+
+        let remaining_tokens = max_token_count as isize - token_count as isize;
+        let token_count_color = if remaining_tokens <= 0 {
             Color::Error
-        } else if remaining_tokens <= 500 {
+        } else if token_count as f32 / max_token_count as f32 >= 0.8 {
             Color::Warning
         } else {
             Color::Muted
         };
+
         Some(
-            Label::new(remaining_tokens.to_string())
-                .size(LabelSize::Small)
-                .color(remaining_tokens_color),
+            h_flex()
+                .gap_0p5()
+                .child(
+                    Label::new(humanize_token_count(token_count))
+                        .size(LabelSize::Small)
+                        .color(token_count_color),
+                )
+                .child(Label::new("/").size(LabelSize::Small).color(Color::Muted))
+                .child(
+                    Label::new(humanize_token_count(max_token_count))
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                ),
         )
     }
 }
@@ -988,6 +1075,7 @@ impl Panel for AssistantPanel {
 }
 
 impl EventEmitter<PanelEvent> for AssistantPanel {}
+impl EventEmitter<AssistantPanelEvent> for AssistantPanel {}
 
 impl FocusableView for AssistantPanel {
     fn focus_handle(&self, _cx: &AppContext) -> FocusHandle {
@@ -1024,6 +1112,7 @@ pub struct Context {
     edit_suggestions: Vec<EditSuggestion>,
     pending_slash_commands: Vec<PendingSlashCommand>,
     edits_since_last_slash_command_parse: language::Subscription,
+    slash_command_output_sections: Vec<SlashCommandOutputSection<language::Anchor>>,
     message_anchors: Vec<MessageAnchor>,
     messages_metadata: HashMap<MessageId, MessageMetadata>,
     next_message_id: MessageId,
@@ -1065,6 +1154,7 @@ impl Context {
             next_message_id: Default::default(),
             edit_suggestions: Vec::new(),
             pending_slash_commands: Vec::new(),
+            slash_command_output_sections: Vec::new(),
             edits_since_last_slash_command_parse,
             summary: None,
             pending_summary: Task::ready(None),
@@ -1101,11 +1191,12 @@ impl Context {
     }
 
     fn serialize(&self, cx: &AppContext) -> SavedContext {
+        let buffer = self.buffer.read(cx);
         SavedContext {
             id: self.id.clone(),
             zed: "context".into(),
             version: SavedContext::VERSION.into(),
-            text: self.buffer.read(cx).text(),
+            text: buffer.text(),
             message_metadata: self.messages_metadata.clone(),
             messages: self
                 .messages(cx)
@@ -1119,6 +1210,22 @@ impl Context {
                 .as_ref()
                 .map(|summary| summary.text.clone())
                 .unwrap_or_default(),
+            slash_command_output_sections: self
+                .slash_command_output_sections
+                .iter()
+                .filter_map(|section| {
+                    let range = section.range.to_offset(buffer);
+                    if section.range.start.is_valid(buffer) && !range.is_empty() {
+                        Some(SlashCommandOutputSection {
+                            range,
+                            icon: section.icon,
+                            label: section.label.clone(),
+                        })
+                    } else {
+                        None
+                    }
+                })
+                .collect(),
         }
     }
 
@@ -1170,6 +1277,19 @@ impl Context {
                 next_message_id,
                 edit_suggestions: Vec::new(),
                 pending_slash_commands: Vec::new(),
+                slash_command_output_sections: saved_context
+                    .slash_command_output_sections
+                    .into_iter()
+                    .map(|section| {
+                        let buffer = buffer.read(cx);
+                        SlashCommandOutputSection {
+                            range: buffer.anchor_after(section.range.start)
+                                ..buffer.anchor_before(section.range.end),
+                            icon: section.icon,
+                            label: section.label,
+                        }
+                    })
+                    .collect(),
                 edits_since_last_slash_command_parse,
                 summary: Some(Summary {
                     text: saved_context.summary,
@@ -1468,10 +1588,17 @@ impl Context {
                                 .map(|section| SlashCommandOutputSection {
                                     range: buffer.anchor_after(start + section.range.start)
                                         ..buffer.anchor_before(start + section.range.end),
-                                    render_placeholder: section.render_placeholder,
+                                    icon: section.icon,
+                                    label: section.label,
                                 })
                                 .collect::<Vec<_>>();
                             sections.sort_by(|a, b| a.range.cmp(&b.range, buffer));
+
+                            this.slash_command_output_sections
+                                .extend(sections.iter().cloned());
+                            this.slash_command_output_sections
+                                .sort_by(|a, b| a.range.cmp(&b.range, buffer));
+
                             ContextEvent::SlashCommandFinished {
                                 output_range: buffer.anchor_after(start)
                                     ..buffer.anchor_before(new_end),
@@ -1507,11 +1634,6 @@ impl Context {
                 updated: vec![pending_command.clone()],
             });
         }
-    }
-
-    fn remaining_tokens(&self, cx: &AppContext) -> Option<isize> {
-        let model = CompletionProvider::global(cx).model();
-        Some(model.max_token_count() as isize - self.token_count? as isize)
     }
 
     fn completion_provider_changed(&mut self, cx: &mut ModelContext<Self>) {
@@ -2015,7 +2137,7 @@ impl Context {
                     let mut discriminant = 1;
                     let mut new_path;
                     loop {
-                        new_path = CONTEXTS_DIR.join(&format!(
+                        new_path = contexts_dir().join(&format!(
                             "{} - {}.zed.json",
                             summary.trim(),
                             discriminant
@@ -2029,7 +2151,7 @@ impl Context {
                     new_path
                 };
 
-                fs.create_dir(CONTEXTS_DIR.as_ref()).await?;
+                fs.create_dir(contexts_dir().as_ref()).await?;
                 fs.atomic_write(path.clone(), serde_json::to_string(&context).unwrap())
                     .await?;
                 this.update(&mut cx, |this, _| this.path = Some(path))?;
@@ -2154,6 +2276,7 @@ struct PendingCompletion {
 }
 
 enum ContextEditorEvent {
+    Edited,
     TabContentChanged,
 }
 
@@ -2172,7 +2295,8 @@ pub struct ContextEditor {
     editor: View<Editor>,
     blocks: HashSet<BlockId>,
     scroll_position: Option<ScrollPosition>,
-    pending_slash_command_flaps: HashMap<Range<language::Anchor>, FlapId>,
+    pending_slash_command_creases: HashMap<Range<language::Anchor>, CreaseId>,
+    pending_slash_command_blocks: HashMap<Range<language::Anchor>, BlockId>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -2223,6 +2347,7 @@ impl ContextEditor {
             editor.set_show_line_numbers(false, cx);
             editor.set_show_git_diff_gutter(false, cx);
             editor.set_show_code_actions(false, cx);
+            editor.set_show_runnables(false, cx);
             editor.set_show_wrap_guides(false, cx);
             editor.set_show_indent_guides(false, cx);
             editor.set_completion_provider(Box::new(completion_provider));
@@ -2235,6 +2360,7 @@ impl ContextEditor {
             cx.subscribe(&editor, Self::handle_editor_event),
         ];
 
+        let sections = context.read(cx).slash_command_output_sections.clone();
         let mut this = Self {
             context,
             editor,
@@ -2244,10 +2370,12 @@ impl ContextEditor {
             scroll_position: None,
             fs,
             workspace: workspace.downgrade(),
-            pending_slash_command_flaps: HashMap::default(),
+            pending_slash_command_creases: HashMap::default(),
+            pending_slash_command_blocks: HashMap::default(),
             _subscriptions,
         };
         this.update_message_headers(cx);
+        this.insert_slash_command_output_sections(sections, cx);
         this
     }
 
@@ -2364,7 +2492,7 @@ impl ContextEditor {
                     editor.insert(&format!("/{name}"), cx);
                     if command.requires_argument() {
                         editor.insert(" ", cx);
-                        editor.show_completions(&ShowCompletions, cx);
+                        editor.show_completions(&ShowCompletions::default(), cx);
                     }
                 });
             });
@@ -2505,16 +2633,27 @@ impl ContextEditor {
             ContextEvent::PendingSlashCommandsUpdated { removed, updated } => {
                 self.editor.update(cx, |editor, cx| {
                     let buffer = editor.buffer().read(cx).snapshot(cx);
-                    let excerpt_id = *buffer.as_singleton().unwrap().0;
+                    let (excerpt_id, buffer_id, _) = buffer.as_singleton().unwrap();
+                    let excerpt_id = *excerpt_id;
 
-                    editor.remove_flaps(
+                    editor.remove_creases(
                         removed
                             .iter()
-                            .filter_map(|range| self.pending_slash_command_flaps.remove(range)),
+                            .filter_map(|range| self.pending_slash_command_creases.remove(range)),
                         cx,
                     );
 
-                    let flap_ids = editor.insert_flaps(
+                    editor.remove_blocks(
+                        HashSet::from_iter(
+                            removed.iter().filter_map(|range| {
+                                self.pending_slash_command_blocks.remove(range)
+                            }),
+                        ),
+                        None,
+                        cx,
+                    );
+
+                    let crease_ids = editor.insert_creases(
                         updated.iter().map(|command| {
                             let workspace = self.workspace.clone();
                             let confirm_command = Arc::new({
@@ -2546,13 +2685,28 @@ impl ContextEditor {
                                 move |row, _, _, _cx: &mut WindowContext| {
                                     render_pending_slash_command_gutter_decoration(
                                         row,
-                                        command.status.clone(),
+                                        &command.status,
                                         confirm_command.clone(),
                                     )
                                 }
                             };
-                            let render_trailer =
-                                |_row, _unfold, _cx: &mut WindowContext| Empty.into_any();
+                            let render_trailer = {
+                                let command = command.clone();
+                                move |row, _unfold, cx: &mut WindowContext| {
+                                    // TODO: In the future we should investigate how we can expose
+                                    // this as a hook on the `SlashCommand` trait so that we don't
+                                    // need to special-case it here.
+                                    if command.name == DocsSlashCommand::NAME {
+                                        return render_docs_slash_command_trailer(
+                                            row,
+                                            command.clone(),
+                                            cx,
+                                        );
+                                    }
+
+                                    Empty.into_any()
+                                }
+                            };
 
                             let start = buffer
                                 .anchor_in_excerpt(excerpt_id, command.source_range.start)
@@ -2560,16 +2714,47 @@ impl ContextEditor {
                             let end = buffer
                                 .anchor_in_excerpt(excerpt_id, command.source_range.end)
                                 .unwrap();
-                            Flap::new(start..end, placeholder, render_toggle, render_trailer)
+                            Crease::new(start..end, placeholder, render_toggle, render_trailer)
                         }),
                         cx,
                     );
 
-                    self.pending_slash_command_flaps.extend(
+                    let block_ids = editor.insert_blocks(
+                        updated
+                            .iter()
+                            .filter_map(|command| match &command.status {
+                                PendingSlashCommandStatus::Error(error) => {
+                                    Some((command, error.clone()))
+                                }
+                                _ => None,
+                            })
+                            .map(|(command, error_message)| BlockProperties {
+                                style: BlockStyle::Fixed,
+                                position: Anchor {
+                                    buffer_id: Some(buffer_id),
+                                    excerpt_id,
+                                    text_anchor: command.source_range.start,
+                                },
+                                height: 1,
+                                disposition: BlockDisposition::Below,
+                                render: slash_command_error_block_renderer(error_message),
+                            }),
+                        None,
+                        cx,
+                    );
+
+                    self.pending_slash_command_creases.extend(
                         updated
                             .iter()
                             .map(|command| command.source_range.clone())
-                            .zip(flap_ids),
+                            .zip(crease_ids),
+                    );
+
+                    self.pending_slash_command_blocks.extend(
+                        updated
+                            .iter()
+                            .map(|command| command.source_range.clone())
+                            .zip(block_ids),
                     );
                 })
             }
@@ -2612,7 +2797,7 @@ impl ContextEditor {
             let buffer = editor.buffer().read(cx).snapshot(cx);
             let excerpt_id = *buffer.as_singleton().unwrap().0;
             let mut buffer_rows_to_fold = BTreeSet::new();
-            let mut flaps = Vec::new();
+            let mut creases = Vec::new();
             for section in sections {
                 let start = buffer
                     .anchor_in_excerpt(excerpt_id, section.range.start)
@@ -2622,26 +2807,32 @@ impl ContextEditor {
                     .unwrap();
                 let buffer_row = MultiBufferRow(start.to_point(&buffer).row);
                 buffer_rows_to_fold.insert(buffer_row);
-                flaps.push(Flap::new(
+                creases.push(Crease::new(
                     start..end,
                     FoldPlaceholder {
                         render: Arc::new({
                             let editor = cx.view().downgrade();
-                            let render_placeholder = section.render_placeholder.clone();
-                            move |fold_id, fold_range, cx| {
+                            let icon = section.icon;
+                            let label = section.label.clone();
+                            move |fold_id, fold_range, _cx| {
                                 let editor = editor.clone();
-                                let unfold = Arc::new(move |cx: &mut WindowContext| {
-                                    editor
-                                        .update(cx, |editor, cx| {
-                                            let buffer_start = fold_range
-                                                .start
-                                                .to_point(&editor.buffer().read(cx).read(cx));
-                                            let buffer_row = MultiBufferRow(buffer_start.row);
-                                            editor.unfold_at(&UnfoldAt { buffer_row }, cx);
-                                        })
-                                        .ok();
-                                });
-                                render_placeholder(fold_id.into(), unfold, cx)
+                                ButtonLike::new(fold_id)
+                                    .style(ButtonStyle::Filled)
+                                    .layer(ElevationIndex::ElevatedSurface)
+                                    .child(Icon::new(icon))
+                                    .child(Label::new(label.clone()).single_line())
+                                    .on_click(move |_, cx| {
+                                        editor
+                                            .update(cx, |editor, cx| {
+                                                let buffer_start = fold_range
+                                                    .start
+                                                    .to_point(&editor.buffer().read(cx).read(cx));
+                                                let buffer_row = MultiBufferRow(buffer_start.row);
+                                                editor.unfold_at(&UnfoldAt { buffer_row }, cx);
+                                            })
+                                            .ok();
+                                    })
+                                    .into_any_element()
                             }
                         }),
                         constrain_width: false,
@@ -2652,7 +2843,7 @@ impl ContextEditor {
                 ));
             }
 
-            editor.insert_flaps(flaps, cx);
+            editor.insert_creases(creases, cx);
 
             for buffer_row in buffer_rows_to_fold.into_iter().rev() {
                 editor.fold_at(&FoldAt { buffer_row }, cx);
@@ -2678,6 +2869,7 @@ impl ContextEditor {
             EditorEvent::SelectionsChanged { .. } => {
                 self.scroll_position = self.cursor_scroll_position(cx);
             }
+            EditorEvent::BufferEdited => cx.emit(ContextEditorEvent::Edited),
             _ => {}
         }
     }
@@ -2784,6 +2976,42 @@ impl ContextEditor {
             let ids = editor.insert_blocks(new_blocks, None, cx);
             self.blocks = HashSet::from_iter(ids);
         });
+    }
+
+    fn insert_selection(
+        workspace: &mut Workspace,
+        _: &InsertIntoEditor,
+        cx: &mut ViewContext<Workspace>,
+    ) {
+        let Some(panel) = workspace.panel::<AssistantPanel>(cx) else {
+            return;
+        };
+        let Some(context_editor_view) = panel.read(cx).active_context_editor().cloned() else {
+            return;
+        };
+        let Some(active_editor_view) = workspace
+            .active_item(cx)
+            .and_then(|item| item.act_as::<Editor>(cx))
+        else {
+            return;
+        };
+
+        let context_editor = context_editor_view.read(cx).editor.read(cx);
+        let anchor = context_editor.selections.newest_anchor();
+        let text = context_editor
+            .buffer()
+            .read(cx)
+            .read(cx)
+            .text_for_range(anchor.range())
+            .collect::<String>();
+
+        // If nothing is selected, don't delete the current selection; instead, be a no-op.
+        if !text.is_empty() {
+            active_editor_view.update(cx, |editor, cx| {
+                editor.insert(&text, cx);
+                editor.focus(cx);
+            })
+        }
     }
 
     fn quote_selection(
@@ -3146,22 +3374,15 @@ fn render_slash_command_output_toggle(
     fold: ToggleFold,
     _cx: &mut WindowContext,
 ) -> AnyElement {
-    IconButton::new(
-        ("slash-command-output-fold-indicator", row.0),
-        ui::IconName::ChevronDown,
-    )
-    .on_click(move |_e, cx| fold(!is_folded, cx))
-    .icon_color(ui::Color::Muted)
-    .icon_size(ui::IconSize::Small)
-    .selected(is_folded)
-    .selected_icon(ui::IconName::ChevronRight)
-    .size(ui::ButtonSize::None)
-    .into_any_element()
+    Disclosure::new(("slash-command-output-fold-indicator", row.0), !is_folded)
+        .selected(is_folded)
+        .on_click(move |_e, cx| fold(!is_folded, cx))
+        .into_any_element()
 }
 
 fn render_pending_slash_command_gutter_decoration(
     row: MultiBufferRow,
-    status: PendingSlashCommandStatus,
+    status: &PendingSlashCommandStatus,
     confirm_command: Arc<dyn Fn(&mut WindowContext)>,
 ) -> AnyElement {
     let mut icon = IconButton::new(
@@ -3179,14 +3400,47 @@ fn render_pending_slash_command_gutter_decoration(
         PendingSlashCommandStatus::Running { .. } => {
             icon = icon.selected(true);
         }
-        PendingSlashCommandStatus::Error(error) => {
-            icon = icon
-                .icon_color(Color::Error)
-                .tooltip(move |cx| Tooltip::text(format!("error: {error}"), cx));
-        }
+        PendingSlashCommandStatus::Error(_) => icon = icon.icon_color(Color::Error),
     }
 
     icon.into_any_element()
+}
+
+fn render_docs_slash_command_trailer(
+    row: MultiBufferRow,
+    command: PendingSlashCommand,
+    cx: &mut WindowContext,
+) -> AnyElement {
+    let Some(argument) = command.argument else {
+        return Empty.into_any();
+    };
+
+    let args = DocsSlashCommandArgs::parse(&argument);
+
+    let Some(store) = args
+        .provider()
+        .and_then(|provider| IndexedDocsStore::try_global(provider, cx).ok())
+    else {
+        return Empty.into_any();
+    };
+
+    let Some(package) = args.package() else {
+        return Empty.into_any();
+    };
+
+    if !store.is_indexing(&package) {
+        return Empty.into_any();
+    }
+
+    div()
+        .id(("crates-being-indexed", row.0))
+        .child(Icon::new(IconName::ArrowCircle).with_animation(
+            "arrow-circle",
+            Animation::new(Duration::from_secs(4)).repeat(),
+            |icon, delta| icon.transform(Transformation::rotate(percentage(delta))),
+        ))
+        .tooltip(move |cx| Tooltip::text(format!("Indexing {package}…"), cx))
+        .into_any_element()
 }
 
 fn make_lsp_adapter_delegate(
@@ -3200,6 +3454,19 @@ fn make_lsp_adapter_delegate(
             .next()
             .ok_or_else(|| anyhow!("no worktrees when constructing ProjectLspAdapterDelegate"))?;
         Ok(ProjectLspAdapterDelegate::new(project, &worktree, cx) as Arc<dyn LspAdapterDelegate>)
+    })
+}
+
+fn slash_command_error_block_renderer(message: String) -> RenderBlock {
+    Box::new(move |_| {
+        div()
+            .pl_6()
+            .child(
+                Label::new(format!("error: {}", message))
+                    .single_line()
+                    .color(Color::Error),
+            )
+            .into_any()
     })
 }
 

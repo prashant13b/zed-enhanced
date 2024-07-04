@@ -28,7 +28,7 @@ use language::{
 use multi_buffer::MultiBufferRow;
 use project::{
     project_settings::{InlineBlameSettings, ProjectSettings},
-    SERVER_PROGRESS_DEBOUNCE_TIMEOUT,
+    SERVER_PROGRESS_THROTTLE_TIMEOUT,
 };
 use recent_projects::disconnected_overlay::DisconnectedOverlay;
 use rpc::RECEIVE_TIMEOUT;
@@ -1006,6 +1006,8 @@ async fn test_language_server_statuses(cx_a: &mut TestAppContext, cx_b: &mut Tes
 
     let fake_language_server = fake_language_servers.next().await.unwrap();
     fake_language_server.start_progress("the-token").await;
+
+    executor.advance_clock(SERVER_PROGRESS_THROTTLE_TIMEOUT);
     fake_language_server.notify::<lsp::notification::Progress>(lsp::ProgressParams {
         token: lsp::NumberOrString::String("the-token".to_string()),
         value: lsp::ProgressParamsValue::WorkDone(lsp::WorkDoneProgress::Report(
@@ -1015,11 +1017,10 @@ async fn test_language_server_statuses(cx_a: &mut TestAppContext, cx_b: &mut Tes
             },
         )),
     });
-    executor.advance_clock(SERVER_PROGRESS_DEBOUNCE_TIMEOUT);
     executor.run_until_parked();
 
     project_a.read_with(cx_a, |project, _| {
-        let status = project.language_server_statuses().next().unwrap();
+        let status = project.language_server_statuses().next().unwrap().1;
         assert_eq!(status.name, "the-language-server");
         assert_eq!(status.pending_work.len(), 1);
         assert_eq!(
@@ -1036,10 +1037,11 @@ async fn test_language_server_statuses(cx_a: &mut TestAppContext, cx_b: &mut Tes
     let project_b = client_b.build_dev_server_project(project_id, cx_b).await;
 
     project_b.read_with(cx_b, |project, _| {
-        let status = project.language_server_statuses().next().unwrap();
+        let status = project.language_server_statuses().next().unwrap().1;
         assert_eq!(status.name, "the-language-server");
     });
 
+    executor.advance_clock(SERVER_PROGRESS_THROTTLE_TIMEOUT);
     fake_language_server.notify::<lsp::notification::Progress>(lsp::ProgressParams {
         token: lsp::NumberOrString::String("the-token".to_string()),
         value: lsp::ProgressParamsValue::WorkDone(lsp::WorkDoneProgress::Report(
@@ -1049,11 +1051,10 @@ async fn test_language_server_statuses(cx_a: &mut TestAppContext, cx_b: &mut Tes
             },
         )),
     });
-    executor.advance_clock(SERVER_PROGRESS_DEBOUNCE_TIMEOUT);
     executor.run_until_parked();
 
     project_a.read_with(cx_a, |project, _| {
-        let status = project.language_server_statuses().next().unwrap();
+        let status = project.language_server_statuses().next().unwrap().1;
         assert_eq!(status.name, "the-language-server");
         assert_eq!(status.pending_work.len(), 1);
         assert_eq!(
@@ -1063,7 +1064,7 @@ async fn test_language_server_statuses(cx_a: &mut TestAppContext, cx_b: &mut Tes
     });
 
     project_b.read_with(cx_b, |project, _| {
-        let status = project.language_server_statuses().next().unwrap();
+        let status = project.language_server_statuses().next().unwrap().1;
         assert_eq!(status.name, "the-language-server");
         assert_eq!(status.pending_work.len(), 1);
         assert_eq!(
@@ -1203,7 +1204,7 @@ async fn test_share_project(
     buffer_a.read_with(cx_a, |buffer, _| {
         buffer
             .snapshot()
-            .remote_selections_in_range(text::Anchor::MIN..text::Anchor::MAX)
+            .selections_in_range(text::Anchor::MIN..text::Anchor::MAX, false)
             .count()
             == 1
     });
@@ -1244,7 +1245,7 @@ async fn test_share_project(
     buffer_a.read_with(cx_a, |buffer, _| {
         buffer
             .snapshot()
-            .remote_selections_in_range(text::Anchor::MIN..text::Anchor::MAX)
+            .selections_in_range(text::Anchor::MIN..text::Anchor::MAX, false)
             .count()
             == 0
     });
