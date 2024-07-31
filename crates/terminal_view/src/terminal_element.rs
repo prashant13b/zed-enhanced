@@ -27,8 +27,8 @@ use theme::{ActiveTheme, Theme, ThemeSettings};
 use ui::{ParentElement, Tooltip};
 use workspace::Workspace;
 
-use std::{fmt::Debug, ops::RangeInclusive};
-use std::{mem, sync::Arc};
+use std::mem;
+use std::{fmt::Debug, ops::RangeInclusive, rc::Rc};
 
 use crate::{BlockContext, BlockProperties, TerminalView};
 
@@ -156,7 +156,7 @@ pub struct TerminalElement {
     cursor_visible: bool,
     can_navigate_to_selected_word: bool,
     interactivity: Interactivity,
-    block_below_cursor: Option<Arc<BlockProperties>>,
+    block_below_cursor: Option<Rc<BlockProperties>>,
 }
 
 impl InteractiveElement for TerminalElement {
@@ -177,7 +177,7 @@ impl TerminalElement {
         focused: bool,
         cursor_visible: bool,
         can_navigate_to_selected_word: bool,
-        block_below_cursor: Option<Arc<BlockProperties>>,
+        block_below_cursor: Option<Rc<BlockProperties>>,
     ) -> TerminalElement {
         TerminalElement {
             terminal,
@@ -370,7 +370,7 @@ impl TerminalElement {
         let weight = if flags.intersects(Flags::BOLD) {
             FontWeight::BOLD
         } else {
-            FontWeight::NORMAL
+            text_style.font_weight
         };
 
         let style = if flags.intersects(Flags::ITALIC) {
@@ -614,16 +614,24 @@ impl Element for TerminalElement {
                 let buffer_font_size = settings.buffer_font_size(cx);
 
                 let terminal_settings = TerminalSettings::get_global(cx);
+
                 let font_family = terminal_settings
                     .font_family
                     .as_ref()
-                    .map(|string| string.clone().into())
-                    .unwrap_or(settings.buffer_font.family);
+                    .unwrap_or(&settings.buffer_font.family)
+                    .clone();
+
+                let font_fallbacks = terminal_settings
+                    .font_fallbacks
+                    .as_ref()
+                    .or(settings.buffer_font.fallbacks.as_ref())
+                    .map(|fallbacks| fallbacks.clone());
 
                 let font_features = terminal_settings
                     .font_features
-                    .clone()
-                    .unwrap_or(settings.buffer_font.features.clone());
+                    .as_ref()
+                    .unwrap_or(&settings.buffer_font.features)
+                    .clone();
 
                 let font_weight = terminal_settings.font_weight.unwrap_or_default();
 
@@ -637,7 +645,7 @@ impl Element for TerminalElement {
 
                 let link_style = HighlightStyle {
                     color: Some(theme.colors().link_text_hover),
-                    font_weight: None,
+                    font_weight: Some(font_weight),
                     font_style: None,
                     background_color: None,
                     underline: Some(UnderlineStyle {
@@ -653,15 +661,16 @@ impl Element for TerminalElement {
                     font_family,
                     font_features,
                     font_weight,
+                    font_fallbacks,
                     font_size: font_size.into(),
                     font_style: FontStyle::Normal,
                     line_height: line_height.into(),
-                    background_color: None,
+                    background_color: Some(theme.colors().terminal_background),
                     white_space: WhiteSpace::Normal,
                     // These are going to be overridden per-cell
                     underline: None,
                     strikethrough: None,
-                    color: theme.colors().text,
+                    color: theme.colors().terminal_foreground,
                 };
 
                 let text_system = cx.text_system();
@@ -1141,8 +1150,8 @@ pub fn convert_color(fg: &terminal::alacritty_terminal::vte::ansi::Color, theme:
             NamedColor::BrightMagenta => colors.terminal_ansi_bright_magenta,
             NamedColor::BrightCyan => colors.terminal_ansi_bright_cyan,
             NamedColor::BrightWhite => colors.terminal_ansi_bright_white,
-            NamedColor::Foreground => colors.text,
-            NamedColor::Background => colors.background,
+            NamedColor::Foreground => colors.terminal_foreground,
+            NamedColor::Background => colors.terminal_background,
             NamedColor::Cursor => theme.players().local().cursor,
             NamedColor::DimBlack => colors.terminal_ansi_dim_black,
             NamedColor::DimRed => colors.terminal_ansi_dim_red,

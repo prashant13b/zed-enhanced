@@ -2,12 +2,16 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use anyhow::Result;
-use assistant_slash_command::{SlashCommand, SlashCommandOutput, SlashCommandOutputSection};
+use assistant_slash_command::{
+    ArgumentCompletion, SlashCommand, SlashCommandOutput, SlashCommandOutputSection,
+};
 use gpui::{AppContext, Task, WeakView};
 use language::{CodeLabel, LspAdapterDelegate};
 use terminal_view::{terminal_panel::TerminalPanel, TerminalView};
 use ui::prelude::*;
-use workspace::Workspace;
+use workspace::{dock::Panel, Workspace};
+
+use crate::DEFAULT_CONTEXT_LINES;
 
 use super::create_label_for_command;
 
@@ -29,7 +33,7 @@ impl SlashCommand for TermSlashCommand {
     }
 
     fn menu_text(&self) -> String {
-        "Insert terminal output".into()
+        "Insert Terminal Output".into()
     }
 
     fn requires_argument(&self) -> bool {
@@ -42,8 +46,12 @@ impl SlashCommand for TermSlashCommand {
         _cancel: Arc<AtomicBool>,
         _workspace: Option<WeakView<Workspace>>,
         _cx: &mut AppContext,
-    ) -> Task<Result<Vec<String>>> {
-        Task::ready(Ok(vec![LINE_COUNT_ARG.to_string()]))
+    ) -> Task<Result<Vec<ArgumentCompletion>>> {
+        Task::ready(Ok(vec![ArgumentCompletion {
+            label: LINE_COUNT_ARG.to_string(),
+            new_text: LINE_COUNT_ARG.to_string(),
+            run_command: true,
+        }]))
     }
 
     fn run(
@@ -59,17 +67,17 @@ impl SlashCommand for TermSlashCommand {
         let Some(terminal_panel) = workspace.read(cx).panel::<TerminalPanel>(cx) else {
             return Task::ready(Err(anyhow::anyhow!("no terminal panel open")));
         };
-        let Some(active_terminal) = terminal_panel
-            .read(cx)
-            .pane()
-            .read(cx)
-            .active_item()
-            .and_then(|t| t.downcast::<TerminalView>())
-        else {
+        let Some(active_terminal) = terminal_panel.read(cx).pane().and_then(|pane| {
+            pane.read(cx)
+                .active_item()
+                .and_then(|t| t.downcast::<TerminalView>())
+        }) else {
             return Task::ready(Err(anyhow::anyhow!("no active terminal")));
         };
 
-        let line_count = argument.and_then(|a| parse_argument(a)).unwrap_or(20);
+        let line_count = argument
+            .and_then(|a| parse_argument(a))
+            .unwrap_or(DEFAULT_CONTEXT_LINES);
 
         let lines = active_terminal
             .read(cx)

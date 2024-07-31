@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Context, Result};
-use futures::{io::BufReader, stream::BoxStream, AsyncBufReadExt, AsyncReadExt, StreamExt};
-use http::{AsyncBody, HttpClient, Method, Request as HttpRequest};
+use futures::{io::BufReader, stream::BoxStream, AsyncBufReadExt, AsyncReadExt, Stream, StreamExt};
+use http_client::{AsyncBody, HttpClient, Method, Request as HttpRequest};
 use isahc::config::Configurable;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -59,6 +59,8 @@ pub enum Model {
     #[serde(rename = "gpt-4o", alias = "gpt-4o-2024-05-13")]
     #[default]
     FourOmni,
+    #[serde(rename = "gpt-4o-mini", alias = "gpt-4o-mini-2024-07-18")]
+    FourOmniMini,
     #[serde(rename = "custom")]
     Custom { name: String, max_tokens: usize },
 }
@@ -70,17 +72,19 @@ impl Model {
             "gpt-4" => Ok(Self::Four),
             "gpt-4-turbo-preview" => Ok(Self::FourTurbo),
             "gpt-4o" => Ok(Self::FourOmni),
+            "gpt-4o-mini" => Ok(Self::FourOmniMini),
             _ => Err(anyhow!("invalid model id")),
         }
     }
 
-    pub fn id(&self) -> &'static str {
+    pub fn id(&self) -> &str {
         match self {
             Self::ThreePointFiveTurbo => "gpt-3.5-turbo",
             Self::Four => "gpt-4",
             Self::FourTurbo => "gpt-4-turbo-preview",
             Self::FourOmni => "gpt-4o",
-            Self::Custom { .. } => "custom",
+            Self::FourOmniMini => "gpt-4o-mini",
+            Self::Custom { name, .. } => name,
         }
     }
 
@@ -90,53 +94,44 @@ impl Model {
             Self::Four => "gpt-4",
             Self::FourTurbo => "gpt-4-turbo",
             Self::FourOmni => "gpt-4o",
+            Self::FourOmniMini => "gpt-4o-mini",
             Self::Custom { name, .. } => name,
         }
     }
 
     pub fn max_token_count(&self) -> usize {
         match self {
-            Model::ThreePointFiveTurbo => 4096,
-            Model::Four => 8192,
-            Model::FourTurbo => 128000,
-            Model::FourOmni => 128000,
-            Model::Custom { max_tokens, .. } => *max_tokens,
+            Self::ThreePointFiveTurbo => 4096,
+            Self::Four => 8192,
+            Self::FourTurbo => 128000,
+            Self::FourOmni => 128000,
+            Self::FourOmniMini => 128000,
+            Self::Custom { max_tokens, .. } => *max_tokens,
         }
     }
 }
 
-fn serialize_model<S>(model: &Model, serializer: S) -> Result<S::Ok, S::Error>
-where
-    S: serde::Serializer,
-{
-    match model {
-        Model::Custom { name, .. } => serializer.serialize_str(name),
-        _ => serializer.serialize_str(model.id()),
-    }
-}
-
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Request {
-    #[serde(serialize_with = "serialize_model")]
-    pub model: Model,
+    pub model: String,
     pub messages: Vec<RequestMessage>,
     pub stream: bool,
     pub stop: Vec<String>,
     pub temperature: f32,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<ToolDefinition>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct FunctionDefinition {
     pub name: String,
     pub description: Option<String>,
     pub parameters: Option<Map<String, Value>>,
 }
 
-#[derive(Serialize, Debug)]
+#[derive(Deserialize, Serialize, Debug)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ToolDefinition {
     #[allow(dead_code)]
@@ -207,21 +202,21 @@ pub struct FunctionChunk {
     pub arguments: Option<String>,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct Usage {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     pub total_tokens: u32,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct ChoiceDelta {
     pub index: u32,
     pub delta: ResponseMessageDelta,
     pub finish_reason: Option<String>,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct ResponseStreamEvent {
     pub created: u32,
     pub model: String,
@@ -362,4 +357,15 @@ pub fn embed<'a>(
             ))
         }
     }
+}
+
+pub fn extract_text_from_events(
+    response: impl Stream<Item = Result<ResponseStreamEvent>>,
+) -> impl Stream<Item = Result<String>> {
+    response.filter_map(|response| async move {
+        match response {
+            Ok(mut response) => Some(Ok(response.choices.pop()?.delta.content?)),
+            Err(error) => Some(Err(error)),
+        }
+    })
 }

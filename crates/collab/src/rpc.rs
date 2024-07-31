@@ -10,9 +10,9 @@ use crate::{
         ServerId, UpdatedChannelMessage, User, UserId,
     },
     executor::Executor,
-    AppState, Error, RateLimit, RateLimiter, Result,
+    AppState, Config, Error, RateLimit, RateLimiter, Result,
 };
-use anyhow::{anyhow, Context as _};
+use anyhow::{anyhow, bail, Context as _};
 use async_tungstenite::tungstenite::{
     protocol::CloseFrame as TungsteniteCloseFrame, Message as TungsteniteMessage,
 };
@@ -42,12 +42,12 @@ use futures::{
     stream::FuturesUnordered,
     FutureExt, SinkExt, StreamExt, TryStreamExt,
 };
-use http::IsahcHttpClient;
+use http_client::IsahcHttpClient;
 use prometheus::{register_int_gauge, IntGauge};
 use rpc::{
     proto::{
-        self, Ack, AnyTypedEnvelope, EntityMessage, EnvelopedMessage, LanguageModelRole,
-        LiveKitConnectionInfo, RequestMessage, ShareProject, UpdateChannelBufferCollaborators,
+        self, Ack, AnyTypedEnvelope, EntityMessage, EnvelopedMessage, LiveKitConnectionInfo,
+        RequestMessage, ShareProject, UpdateChannelBufferCollaborators,
     },
     Connection, ConnectionId, ErrorCode, ErrorCodeExt, ErrorExt, Peer, Receipt, TypedEnvelope,
 };
@@ -431,11 +431,13 @@ impl Server {
             .add_request_handler(user_handler(join_hosted_project))
             .add_request_handler(user_handler(rejoin_dev_server_projects))
             .add_request_handler(user_handler(create_dev_server_project))
+            .add_request_handler(user_handler(update_dev_server_project))
             .add_request_handler(user_handler(delete_dev_server_project))
             .add_request_handler(user_handler(create_dev_server))
             .add_request_handler(user_handler(regenerate_dev_server_token))
             .add_request_handler(user_handler(rename_dev_server))
             .add_request_handler(user_handler(delete_dev_server))
+            .add_request_handler(user_handler(list_remote_directory))
             .add_request_handler(dev_server_handler(share_dev_server_project))
             .add_request_handler(dev_server_handler(shutdown_dev_server))
             .add_request_handler(dev_server_handler(reconnect_dev_server))
@@ -595,29 +597,51 @@ impl Server {
             .add_message_handler(user_message_handler(acknowledge_channel_message))
             .add_message_handler(user_message_handler(acknowledge_buffer_version))
             .add_request_handler(user_handler(get_supermaven_api_key))
+            .add_request_handler(user_handler(
+                forward_mutating_project_request::<proto::OpenContext>,
+            ))
+            .add_request_handler(user_handler(
+                forward_mutating_project_request::<proto::CreateContext>,
+            ))
+            .add_request_handler(user_handler(
+                forward_mutating_project_request::<proto::SynchronizeContexts>,
+            ))
+            .add_message_handler(broadcast_project_message_from_host::<proto::AdvertiseContexts>)
+            .add_message_handler(update_context)
+            .add_request_handler({
+                let app_state = app_state.clone();
+                move |request, response, session| {
+                    let app_state = app_state.clone();
+                    async move {
+                        complete_with_language_model(request, response, session, &app_state.config)
+                            .await
+                    }
+                }
+            })
             .add_streaming_request_handler({
                 let app_state = app_state.clone();
                 move |request, response, session| {
-                    complete_with_language_model(
-                        request,
-                        response,
-                        session,
-                        app_state.config.openai_api_key.clone(),
-                        app_state.config.google_ai_api_key.clone(),
-                        app_state.config.anthropic_api_key.clone(),
-                    )
+                    let app_state = app_state.clone();
+                    async move {
+                        stream_complete_with_language_model(
+                            request,
+                            response,
+                            session,
+                            &app_state.config,
+                        )
+                        .await
+                    }
                 }
             })
             .add_request_handler({
                 let app_state = app_state.clone();
-                user_handler(move |request, response, session| {
-                    count_tokens_with_language_model(
-                        request,
-                        response,
-                        session,
-                        app_state.config.google_ai_api_key.clone(),
-                    )
-                })
+                move |request, response, session| {
+                    let app_state = app_state.clone();
+                    async move {
+                        count_language_model_tokens(request, response, session, &app_state.config)
+                            .await
+                    }
+                }
             })
             .add_request_handler({
                 user_handler(move |request, response, session| {
@@ -971,7 +995,8 @@ impl Server {
             tracing::Span::current().record("connection_id", format!("{}", connection_id));
             tracing::info!("connection opened");
 
-            let http_client = match IsahcHttpClient::new() {
+            let user_agent = format!("Zed Server/{}", env!("CARGO_PKG_VERSION"));
+            let http_client = match IsahcHttpClient::builder().default_header("User-Agent", user_agent).build() {
                 Ok(http_client) => Arc::new(http_client),
                 Err(error) => {
                     tracing::error!(?error, "failed to create HTTP client");
@@ -1111,6 +1136,8 @@ impl Server {
                         .set_user_connected_once(user.id, true)
                         .await?;
                 }
+
+                update_user_plan(user.id, session).await?;
 
                 let (contacts, dev_server_projects) = future::try_join(
                     self.app_state.db.get_contacts(user.id),
@@ -1382,7 +1409,7 @@ pub async fn handle_websocket_request(
         let socket = socket
             .map_ok(to_tungstenite_message)
             .err_into()
-            .with(|message| async move { Ok(to_axum_message(message)) });
+            .with(|message| async move { to_axum_message(message) });
         let connection = Connection::new(Box::pin(socket));
         async move {
             server
@@ -2305,6 +2332,69 @@ async fn join_hosted_project(
     join_project_internal(response, session, &mut project, &replica_id)
 }
 
+async fn list_remote_directory(
+    request: proto::ListRemoteDirectory,
+    response: Response<proto::ListRemoteDirectory>,
+    session: UserSession,
+) -> Result<()> {
+    let dev_server_id = DevServerId(request.dev_server_id as i32);
+    let dev_server_connection_id = session
+        .connection_pool()
+        .await
+        .dev_server_connection_id_supporting(dev_server_id, ZedVersion::with_list_directory())?;
+
+    session
+        .db()
+        .await
+        .get_dev_server_for_user(dev_server_id, session.user_id())
+        .await?;
+
+    response.send(
+        session
+            .peer
+            .forward_request(session.connection_id, dev_server_connection_id, request)
+            .await?,
+    )?;
+    Ok(())
+}
+
+async fn update_dev_server_project(
+    request: proto::UpdateDevServerProject,
+    response: Response<proto::UpdateDevServerProject>,
+    session: UserSession,
+) -> Result<()> {
+    let dev_server_project_id = DevServerProjectId(request.dev_server_project_id as i32);
+
+    let (dev_server_project, update) = session
+        .db()
+        .await
+        .update_dev_server_project(dev_server_project_id, &request.paths, session.user_id())
+        .await?;
+
+    let projects = session
+        .db()
+        .await
+        .get_projects_for_dev_server(dev_server_project.dev_server_id)
+        .await?;
+
+    let dev_server_connection_id = session
+        .connection_pool()
+        .await
+        .dev_server_connection_id_supporting(
+            dev_server_project.dev_server_id,
+            ZedVersion::with_list_directory(),
+        )?;
+
+    session.peer.send(
+        dev_server_connection_id,
+        proto::DevServerInstructions { projects },
+    )?;
+
+    send_dev_server_projects_update(session.user_id(), update, &session).await;
+
+    response.send(proto::Ack {})
+}
+
 async fn create_dev_server_project(
     request: proto::CreateDevServerProject,
     response: Response<proto::CreateDevServerProject>,
@@ -3056,6 +3146,53 @@ async fn update_buffer(
     Ok(())
 }
 
+async fn update_context(message: proto::UpdateContext, session: Session) -> Result<()> {
+    let project_id = ProjectId::from_proto(message.project_id);
+
+    let operation = message.operation.as_ref().context("invalid operation")?;
+    let capability = match operation.variant.as_ref() {
+        Some(proto::context_operation::Variant::BufferOperation(buffer_op)) => {
+            if let Some(buffer_op) = buffer_op.operation.as_ref() {
+                match buffer_op.variant {
+                    None | Some(proto::operation::Variant::UpdateSelections(_)) => {
+                        Capability::ReadOnly
+                    }
+                    _ => Capability::ReadWrite,
+                }
+            } else {
+                Capability::ReadWrite
+            }
+        }
+        Some(_) => Capability::ReadWrite,
+        None => Capability::ReadOnly,
+    };
+
+    let guard = session
+        .db()
+        .await
+        .connections_for_buffer_update(
+            project_id,
+            session.principal_id(),
+            session.connection_id,
+            capability,
+        )
+        .await?;
+
+    let (host, guests) = &*guard;
+
+    broadcast(
+        Some(session.connection_id),
+        guests.iter().chain([host]).copied(),
+        |connection_id| {
+            session
+                .peer
+                .forward_send(session.connection_id, connection_id, message.clone())
+        },
+    );
+
+    Ok(())
+}
+
 /// Notify other participants that a project has been updated.
 async fn broadcast_project_message_from_host<T: EntityMessage<Entity = ShareProject>>(
     request: T,
@@ -3398,6 +3535,27 @@ async fn remove_contact(
 
 fn should_auto_subscribe_to_channels(version: ZedVersion) -> bool {
     version.0.minor() < 139
+}
+
+async fn update_user_plan(user_id: UserId, session: &Session) -> Result<()> {
+    let db = session.db().await;
+    let active_subscriptions = db.get_active_billing_subscriptions(user_id).await?;
+
+    let plan = if session.is_staff() || !active_subscriptions.is_empty() {
+        proto::Plan::ZedPro
+    } else {
+        proto::Plan::Free
+    };
+
+    session
+        .peer
+        .send(
+            session.connection_id,
+            proto::UpdateUserPlan { plan: plan.into() },
+        )
+        .trace_err();
+
+    Ok(())
 }
 
 async fn subscribe_to_channels(_: proto::SubscribeToChannels, session: Session) -> Result<()> {
@@ -4395,284 +4553,171 @@ impl RateLimit for CompleteWithLanguageModelRateLimit {
 
 async fn complete_with_language_model(
     request: proto::CompleteWithLanguageModel,
-    response: StreamingResponse<proto::CompleteWithLanguageModel>,
+    response: Response<proto::CompleteWithLanguageModel>,
     session: Session,
-    open_ai_api_key: Option<Arc<str>>,
-    google_ai_api_key: Option<Arc<str>>,
-    anthropic_api_key: Option<Arc<str>>,
+    config: &Config,
 ) -> Result<()> {
     let Some(session) = session.for_user() else {
         return Err(anyhow!("user not found"))?;
     };
     authorize_access_to_language_models(&session).await?;
+
     session
         .rate_limiter
         .check::<CompleteWithLanguageModelRateLimit>(session.user_id())
         .await?;
 
-    if request.model.starts_with("gpt") {
-        let api_key =
-            open_ai_api_key.ok_or_else(|| anyhow!("no OpenAI API key configured on the server"))?;
-        complete_with_open_ai(request, response, session, api_key).await?;
-    } else if request.model.starts_with("gemini") {
-        let api_key = google_ai_api_key
-            .ok_or_else(|| anyhow!("no Google AI API key configured on the server"))?;
-        complete_with_google_ai(request, response, session, api_key).await?;
-    } else if request.model.starts_with("claude") {
-        let api_key = anthropic_api_key
-            .ok_or_else(|| anyhow!("no Anthropic AI API key configured on the server"))?;
-        complete_with_anthropic(request, response, session, api_key).await?;
-    }
-
-    Ok(())
-}
-
-async fn complete_with_open_ai(
-    request: proto::CompleteWithLanguageModel,
-    response: StreamingResponse<proto::CompleteWithLanguageModel>,
-    session: UserSession,
-    api_key: Arc<str>,
-) -> Result<()> {
-    let mut completion_stream = open_ai::stream_completion(
-        session.http_client.as_ref(),
-        OPEN_AI_API_URL,
-        &api_key,
-        crate::ai::language_model_request_to_open_ai(request)?,
-        None,
-    )
-    .await
-    .context("open_ai::stream_completion request failed within collab")?;
-
-    while let Some(event) = completion_stream.next().await {
-        let event = event?;
-        response.send(proto::LanguageModelResponse {
-            choices: event
-                .choices
-                .into_iter()
-                .map(|choice| proto::LanguageModelChoiceDelta {
-                    index: choice.index,
-                    delta: Some(proto::LanguageModelResponseMessage {
-                        role: choice.delta.role.map(|role| match role {
-                            open_ai::Role::User => LanguageModelRole::LanguageModelUser,
-                            open_ai::Role::Assistant => LanguageModelRole::LanguageModelAssistant,
-                            open_ai::Role::System => LanguageModelRole::LanguageModelSystem,
-                            open_ai::Role::Tool => LanguageModelRole::LanguageModelTool,
-                        } as i32),
-                        content: choice.delta.content,
-                        tool_calls: choice
-                            .delta
-                            .tool_calls
-                            .unwrap_or_default()
-                            .into_iter()
-                            .map(|delta| proto::ToolCallDelta {
-                                index: delta.index as u32,
-                                id: delta.id,
-                                variant: match delta.function {
-                                    Some(function) => {
-                                        let name = function.name;
-                                        let arguments = function.arguments;
-
-                                        Some(proto::tool_call_delta::Variant::Function(
-                                            proto::tool_call_delta::FunctionCallDelta {
-                                                name,
-                                                arguments,
-                                            },
-                                        ))
-                                    }
-                                    None => None,
-                                },
-                            })
-                            .collect(),
-                    }),
-                    finish_reason: choice.finish_reason,
-                })
-                .collect(),
-        })?;
-    }
-
-    Ok(())
-}
-
-async fn complete_with_google_ai(
-    request: proto::CompleteWithLanguageModel,
-    response: StreamingResponse<proto::CompleteWithLanguageModel>,
-    session: UserSession,
-    api_key: Arc<str>,
-) -> Result<()> {
-    let mut stream = google_ai::stream_generate_content(
-        session.http_client.clone(),
-        google_ai::API_URL,
-        api_key.as_ref(),
-        &request.model.clone(),
-        crate::ai::language_model_request_to_google_ai(request)?,
-    )
-    .await
-    .context("google_ai::stream_generate_content request failed")?;
-
-    while let Some(event) = stream.next().await {
-        let event = event?;
-        response.send(proto::LanguageModelResponse {
-            choices: event
-                .candidates
-                .unwrap_or_default()
-                .into_iter()
-                .map(|candidate| proto::LanguageModelChoiceDelta {
-                    index: candidate.index as u32,
-                    delta: Some(proto::LanguageModelResponseMessage {
-                        role: Some(match candidate.content.role {
-                            google_ai::Role::User => LanguageModelRole::LanguageModelUser,
-                            google_ai::Role::Model => LanguageModelRole::LanguageModelAssistant,
-                        } as i32),
-                        content: Some(
-                            candidate
-                                .content
-                                .parts
-                                .into_iter()
-                                .filter_map(|part| match part {
-                                    google_ai::Part::TextPart(part) => Some(part.text),
-                                    google_ai::Part::InlineDataPart(_) => None,
-                                })
-                                .collect(),
-                        ),
-                        // Tool calls are not supported for Google
-                        tool_calls: Vec::new(),
-                    }),
-                    finish_reason: candidate.finish_reason.map(|reason| reason.to_string()),
-                })
-                .collect(),
-        })?;
-    }
-
-    Ok(())
-}
-
-async fn complete_with_anthropic(
-    request: proto::CompleteWithLanguageModel,
-    response: StreamingResponse<proto::CompleteWithLanguageModel>,
-    session: UserSession,
-    api_key: Arc<str>,
-) -> Result<()> {
-    let model = anthropic::Model::from_id(&request.model)?;
-
-    let mut system_message = String::new();
-    let messages = request
-        .messages
-        .into_iter()
-        .filter_map(|message| {
-            match message.role() {
-                LanguageModelRole::LanguageModelUser => Some(anthropic::RequestMessage {
-                    role: anthropic::Role::User,
-                    content: message.content,
-                }),
-                LanguageModelRole::LanguageModelAssistant => Some(anthropic::RequestMessage {
-                    role: anthropic::Role::Assistant,
-                    content: message.content,
-                }),
-                // Anthropic's API breaks system instructions out as a separate field rather
-                // than having a system message role.
-                LanguageModelRole::LanguageModelSystem => {
-                    if !system_message.is_empty() {
-                        system_message.push_str("\n\n");
-                    }
-                    system_message.push_str(&message.content);
-
-                    None
-                }
-                // We don't yet support tool calls for Anthropic
-                LanguageModelRole::LanguageModelTool => None,
-            }
-        })
-        .collect();
-
-    let mut stream = anthropic::stream_completion(
-        session.http_client.as_ref(),
-        anthropic::ANTHROPIC_API_URL,
-        &api_key,
-        anthropic::Request {
-            model,
-            messages,
-            stream: true,
-            system: system_message,
-            max_tokens: 4092,
-        },
-        None,
-    )
-    .await?;
-
-    let mut current_role = proto::LanguageModelRole::LanguageModelAssistant;
-
-    while let Some(event) = stream.next().await {
-        let event = event?;
-
-        match event {
-            anthropic::ResponseEvent::MessageStart { message } => {
-                if let Some(role) = message.role {
-                    if role == "assistant" {
-                        current_role = proto::LanguageModelRole::LanguageModelAssistant;
-                    } else if role == "user" {
-                        current_role = proto::LanguageModelRole::LanguageModelUser;
-                    }
-                }
-            }
-            anthropic::ResponseEvent::ContentBlockStart { content_block, .. } => {
-                match content_block {
-                    anthropic::ContentBlock::Text { text } => {
-                        if !text.is_empty() {
-                            response.send(proto::LanguageModelResponse {
-                                choices: vec![proto::LanguageModelChoiceDelta {
-                                    index: 0,
-                                    delta: Some(proto::LanguageModelResponseMessage {
-                                        role: Some(current_role as i32),
-                                        content: Some(text),
-                                        tool_calls: Vec::new(),
-                                    }),
-                                    finish_reason: None,
-                                }],
-                            })?;
-                        }
-                    }
-                }
-            }
-            anthropic::ResponseEvent::ContentBlockDelta { delta, .. } => match delta {
-                anthropic::TextDelta::TextDelta { text } => {
-                    response.send(proto::LanguageModelResponse {
-                        choices: vec![proto::LanguageModelChoiceDelta {
-                            index: 0,
-                            delta: Some(proto::LanguageModelResponseMessage {
-                                role: Some(current_role as i32),
-                                content: Some(text),
-                                tool_calls: Vec::new(),
-                            }),
-                            finish_reason: None,
-                        }],
-                    })?;
-                }
-            },
-            anthropic::ResponseEvent::MessageDelta { delta, .. } => {
-                if let Some(stop_reason) = delta.stop_reason {
-                    response.send(proto::LanguageModelResponse {
-                        choices: vec![proto::LanguageModelChoiceDelta {
-                            index: 0,
-                            delta: None,
-                            finish_reason: Some(stop_reason),
-                        }],
-                    })?;
-                }
-            }
-            anthropic::ResponseEvent::ContentBlockStop { .. } => {}
-            anthropic::ResponseEvent::MessageStop {} => {}
-            anthropic::ResponseEvent::Ping {} => {}
+    let result = match proto::LanguageModelProvider::from_i32(request.provider) {
+        Some(proto::LanguageModelProvider::Anthropic) => {
+            let api_key = config
+                .anthropic_api_key
+                .as_ref()
+                .context("no Anthropic AI API key configured on the server")?;
+            anthropic::complete(
+                session.http_client.as_ref(),
+                anthropic::ANTHROPIC_API_URL,
+                api_key,
+                serde_json::from_str(&request.request)?,
+            )
+            .await?
         }
+        _ => return Err(anyhow!("unsupported provider"))?,
+    };
+
+    response.send(proto::CompleteWithLanguageModelResponse {
+        completion: serde_json::to_string(&result)?,
+    })?;
+
+    Ok(())
+}
+
+async fn stream_complete_with_language_model(
+    request: proto::StreamCompleteWithLanguageModel,
+    response: StreamingResponse<proto::StreamCompleteWithLanguageModel>,
+    session: Session,
+    config: &Config,
+) -> Result<()> {
+    let Some(session) = session.for_user() else {
+        return Err(anyhow!("user not found"))?;
+    };
+    authorize_access_to_language_models(&session).await?;
+
+    session
+        .rate_limiter
+        .check::<CompleteWithLanguageModelRateLimit>(session.user_id())
+        .await?;
+
+    match proto::LanguageModelProvider::from_i32(request.provider) {
+        Some(proto::LanguageModelProvider::Anthropic) => {
+            let api_key = config
+                .anthropic_api_key
+                .as_ref()
+                .context("no Anthropic AI API key configured on the server")?;
+            let mut chunks = anthropic::stream_completion(
+                session.http_client.as_ref(),
+                anthropic::ANTHROPIC_API_URL,
+                api_key,
+                serde_json::from_str(&request.request)?,
+                None,
+            )
+            .await?;
+            while let Some(event) = chunks.next().await {
+                let chunk = event?;
+                response.send(proto::StreamCompleteWithLanguageModelResponse {
+                    event: serde_json::to_string(&chunk)?,
+                })?;
+            }
+        }
+        Some(proto::LanguageModelProvider::OpenAi) => {
+            let api_key = config
+                .openai_api_key
+                .as_ref()
+                .context("no OpenAI API key configured on the server")?;
+            let mut events = open_ai::stream_completion(
+                session.http_client.as_ref(),
+                open_ai::OPEN_AI_API_URL,
+                api_key,
+                serde_json::from_str(&request.request)?,
+                None,
+            )
+            .await?;
+            while let Some(event) = events.next().await {
+                let event = event?;
+                response.send(proto::StreamCompleteWithLanguageModelResponse {
+                    event: serde_json::to_string(&event)?,
+                })?;
+            }
+        }
+        Some(proto::LanguageModelProvider::Google) => {
+            let api_key = config
+                .google_ai_api_key
+                .as_ref()
+                .context("no Google AI API key configured on the server")?;
+            let mut events = google_ai::stream_generate_content(
+                session.http_client.as_ref(),
+                google_ai::API_URL,
+                api_key,
+                serde_json::from_str(&request.request)?,
+            )
+            .await?;
+            while let Some(event) = events.next().await {
+                let event = event?;
+                response.send(proto::StreamCompleteWithLanguageModelResponse {
+                    event: serde_json::to_string(&event)?,
+                })?;
+            }
+        }
+        None => return Err(anyhow!("unknown provider"))?,
     }
 
     Ok(())
 }
 
-struct CountTokensWithLanguageModelRateLimit;
+async fn count_language_model_tokens(
+    request: proto::CountLanguageModelTokens,
+    response: Response<proto::CountLanguageModelTokens>,
+    session: Session,
+    config: &Config,
+) -> Result<()> {
+    let Some(session) = session.for_user() else {
+        return Err(anyhow!("user not found"))?;
+    };
+    authorize_access_to_language_models(&session).await?;
 
-impl RateLimit for CountTokensWithLanguageModelRateLimit {
+    session
+        .rate_limiter
+        .check::<CountLanguageModelTokensRateLimit>(session.user_id())
+        .await?;
+
+    let result = match proto::LanguageModelProvider::from_i32(request.provider) {
+        Some(proto::LanguageModelProvider::Google) => {
+            let api_key = config
+                .google_ai_api_key
+                .as_ref()
+                .context("no Google AI API key configured on the server")?;
+            google_ai::count_tokens(
+                session.http_client.as_ref(),
+                google_ai::API_URL,
+                api_key,
+                serde_json::from_str(&request.request)?,
+            )
+            .await?
+        }
+        _ => return Err(anyhow!("unsupported provider"))?,
+    };
+
+    response.send(proto::CountLanguageModelTokensResponse {
+        token_count: result.total_tokens as u32,
+    })?;
+
+    Ok(())
+}
+
+struct CountLanguageModelTokensRateLimit;
+
+impl RateLimit for CountLanguageModelTokensRateLimit {
     fn capacity() -> usize {
-        std::env::var("COUNT_TOKENS_WITH_LANGUAGE_MODEL_RATE_LIMIT_PER_HOUR")
+        std::env::var("COUNT_LANGUAGE_MODEL_TOKENS_RATE_LIMIT_PER_HOUR")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(600) // Picked arbitrarily
@@ -4683,43 +4728,8 @@ impl RateLimit for CountTokensWithLanguageModelRateLimit {
     }
 
     fn db_name() -> &'static str {
-        "count-tokens-with-language-model"
+        "count-language-model-tokens"
     }
-}
-
-async fn count_tokens_with_language_model(
-    request: proto::CountTokensWithLanguageModel,
-    response: Response<proto::CountTokensWithLanguageModel>,
-    session: UserSession,
-    google_ai_api_key: Option<Arc<str>>,
-) -> Result<()> {
-    authorize_access_to_language_models(&session).await?;
-
-    if !request.model.starts_with("gemini") {
-        return Err(anyhow!(
-            "counting tokens for model: {:?} is not supported",
-            request.model
-        ))?;
-    }
-
-    session
-        .rate_limiter
-        .check::<CountTokensWithLanguageModelRateLimit>(session.user_id())
-        .await?;
-
-    let api_key = google_ai_api_key
-        .ok_or_else(|| anyhow!("no Google AI API key configured on the server"))?;
-    let tokens_response = google_ai::count_tokens(
-        session.http_client.as_ref(),
-        google_ai::API_URL,
-        &api_key,
-        crate::ai::count_tokens_request_to_google_ai(request)?,
-    )
-    .await?;
-    response.send(proto::CountTokensResponse {
-        token_count: tokens_response.total_tokens as u32,
-    })?;
-    Ok(())
 }
 
 struct ComputeEmbeddingsRateLimit;
@@ -5009,8 +5019,8 @@ async fn get_private_user_info(
     Ok(())
 }
 
-fn to_axum_message(message: TungsteniteMessage) -> AxumMessage {
-    match message {
+fn to_axum_message(message: TungsteniteMessage) -> anyhow::Result<AxumMessage> {
+    let message = match message {
         TungsteniteMessage::Text(payload) => AxumMessage::Text(payload),
         TungsteniteMessage::Binary(payload) => AxumMessage::Binary(payload),
         TungsteniteMessage::Ping(payload) => AxumMessage::Ping(payload),
@@ -5019,7 +5029,20 @@ fn to_axum_message(message: TungsteniteMessage) -> AxumMessage {
             code: frame.code.into(),
             reason: frame.reason,
         })),
-    }
+        // We should never receive a frame while reading the message, according
+        // to the `tungstenite` maintainers:
+        //
+        // > It cannot occur when you read messages from the WebSocket, but it
+        // > can be used when you want to send the raw frames (e.g. you want to
+        // > send the frames to the WebSocket without composing the full message first).
+        // >
+        // > — https://github.com/snapview/tungstenite-rs/issues/268
+        TungsteniteMessage::Frame(_) => {
+            bail!("received an unexpected frame while reading the message")
+        }
+    };
+
+    Ok(message)
 }
 
 fn to_tungstenite_message(message: AxumMessage) -> TungsteniteMessage {

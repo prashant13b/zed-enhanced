@@ -14,12 +14,11 @@ use derive_more::{Deref, DerefMut};
 use futures::{channel::oneshot, future::LocalBoxFuture, Future};
 use slotmap::SlotMap;
 use smol::future::FutureExt;
-use time::UtcOffset;
 
 pub use async_context::*;
 use collections::{FxHashMap, FxHashSet, VecDeque};
 pub use entity_map::*;
-use http::{self, HttpClient};
+use http_client::HttpClient;
 pub use model_context::*;
 #[cfg(any(test, feature = "test-support"))]
 pub use test_context::*;
@@ -113,9 +112,20 @@ impl App {
         log::info!("GPUI was compiled in test mode");
 
         Self(AppContext::new(
-            current_platform(),
+            current_platform(false),
             Arc::new(()),
-            http::client(None),
+            http_client::client(None, None),
+        ))
+    }
+
+    /// Build an app in headless mode. This prevents opening windows,
+    /// but makes it possible to run an application in an context like
+    /// SSH, where GUI applications are not allowed.
+    pub fn headless() -> Self {
+        Self(AppContext::new(
+            current_platform(true),
+            Arc::new(()),
+            http_client::client(None, None),
         ))
     }
 
@@ -459,6 +469,15 @@ impl AppContext {
             .collect()
     }
 
+    /// Returns the window handles ordered by their appearance on screen, front to back.
+    ///
+    /// The first window in the returned list is the active/topmost window of the application.
+    ///
+    /// This method returns None if the platform doesn't implement the method yet.
+    pub fn window_stack(&self) -> Option<Vec<AnyWindowHandle>> {
+        self.platform.window_stack()
+    }
+
     /// Returns a handle to the window that is currently focused at the platform level, if one exists.
     pub fn active_window(&self) -> Option<AnyWindowHandle> {
         self.platform.active_window()
@@ -612,10 +631,11 @@ impl AppContext {
     /// Displays a platform modal for selecting paths.
     /// When one or more paths are selected, they'll be relayed asynchronously via the returned oneshot channel.
     /// If cancelled, a `None` will be relayed instead.
+    /// May return an error on Linux if the file picker couldn't be opened.
     pub fn prompt_for_paths(
         &self,
         options: PathPromptOptions,
-    ) -> oneshot::Receiver<Option<Vec<PathBuf>>> {
+    ) -> oneshot::Receiver<Result<Option<Vec<PathBuf>>>> {
         self.platform.prompt_for_paths(options)
     }
 
@@ -623,7 +643,11 @@ impl AppContext {
     /// The provided directory will be used to set the initial location.
     /// When a path is selected, it is relayed asynchronously via the returned oneshot channel.
     /// If cancelled, a `None` will be relayed instead.
-    pub fn prompt_for_new_path(&self, directory: &Path) -> oneshot::Receiver<Option<PathBuf>> {
+    /// May return an error on Linux if the file picker couldn't be opened.
+    pub fn prompt_for_new_path(
+        &self,
+        directory: &Path,
+    ) -> oneshot::Receiver<Result<Option<PathBuf>>> {
         self.platform.prompt_for_new_path(directory)
     }
 
@@ -642,13 +666,8 @@ impl AppContext {
         self.platform.restart(binary_path)
     }
 
-    /// Returns the local timezone at the platform level.
-    pub fn local_timezone(&self) -> UtcOffset {
-        self.platform.local_timezone()
-    }
-
     /// Updates the http client assigned to GPUI
-    pub fn update_http_client(&mut self, new_client: Arc<dyn HttpClient>) {
+    pub fn set_http_client(&mut self, new_client: Arc<dyn HttpClient>) {
         self.http_client = new_client;
     }
 
@@ -1120,14 +1139,7 @@ impl AppContext {
         for window in self.windows() {
             window
                 .update(self, |_, cx| {
-                    cx.window
-                        .rendered_frame
-                        .dispatch_tree
-                        .clear_pending_keystrokes();
-                    cx.window
-                        .next_frame
-                        .dispatch_tree
-                        .clear_pending_keystrokes();
+                    cx.clear_pending_keystrokes();
                 })
                 .ok();
         }

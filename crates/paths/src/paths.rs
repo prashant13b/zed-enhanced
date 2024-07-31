@@ -212,6 +212,20 @@ pub fn copilot_dir() -> &'static PathBuf {
     COPILOT_DIR.get_or_init(|| support_dir().join("copilot"))
 }
 
+pub fn copilot_chat_config_path() -> &'static PathBuf {
+    static COPILOT_CHAT_CONFIG_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+    COPILOT_CHAT_CONFIG_DIR.get_or_init(|| {
+        if cfg!(target_os = "windows") {
+            home_dir().join("AppData")
+        } else {
+            home_dir().join(".config")
+        }
+        .join("github-copilot")
+        .join("hosts.json")
+    })
+}
+
 /// Returns the path to the Supermaven directory.
 pub fn supermaven_dir() -> &'static PathBuf {
     static SUPERMAVEN_DIR: OnceLock<PathBuf> = OnceLock::new();
@@ -224,26 +238,28 @@ pub fn default_prettier_dir() -> &'static PathBuf {
     DEFAULT_PRETTIER_DIR.get_or_init(|| support_dir().join("prettier"))
 }
 
+/// Returns the path to the remote server binaries directory.
+pub fn remote_servers_dir() -> &'static PathBuf {
+    static REMOTE_SERVERS_DIR: OnceLock<PathBuf> = OnceLock::new();
+    REMOTE_SERVERS_DIR.get_or_init(|| support_dir().join("remote_servers"))
+}
+
 /// Returns the relative path to a `.zed` folder within a project.
 pub fn local_settings_folder_relative_path() -> &'static Path {
-    static LOCAL_SETTINGS_FOLDER_RELATIVE_PATH: OnceLock<&Path> = OnceLock::new();
-    LOCAL_SETTINGS_FOLDER_RELATIVE_PATH.get_or_init(|| Path::new(".zed"))
+    Path::new(".zed")
 }
 
 /// Returns the relative path to a `settings.json` file within a project.
 pub fn local_settings_file_relative_path() -> &'static Path {
-    static LOCAL_SETTINGS_FILE_RELATIVE_PATH: OnceLock<&Path> = OnceLock::new();
-    LOCAL_SETTINGS_FILE_RELATIVE_PATH.get_or_init(|| Path::new(".zed/settings.json"))
+    Path::new(".zed/settings.json")
 }
 
 /// Returns the relative path to a `tasks.json` file within a project.
 pub fn local_tasks_file_relative_path() -> &'static Path {
-    static LOCAL_TASKS_FILE_RELATIVE_PATH: OnceLock<&Path> = OnceLock::new();
-    LOCAL_TASKS_FILE_RELATIVE_PATH.get_or_init(|| Path::new(".zed/tasks.json"))
+    Path::new(".zed/tasks.json")
 }
 
 /// Returns the relative path to a `.vscode/tasks.json` file within a project.
 pub fn local_vscode_tasks_file_relative_path() -> &'static Path {
-    static LOCAL_VSCODE_TASKS_FILE_RELATIVE_PATH: OnceLock<&Path> = OnceLock::new();
-    LOCAL_VSCODE_TASKS_FILE_RELATIVE_PATH.get_or_init(|| Path::new(".vscode/tasks.json"))
+    Path::new(".vscode/tasks.json")
 }

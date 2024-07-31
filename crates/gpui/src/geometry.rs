@@ -940,6 +940,15 @@ where
     pub fn half_perimeter(&self) -> T {
         self.size.width.clone() + self.size.height.clone()
     }
+
+    /// centered_at creates a new bounds centered at the given point.
+    pub fn centered_at(center: Point<T>, size: Size<T>) -> Self {
+        let origin = Point {
+            x: center.x - size.width.half(),
+            y: center.y - size.height.half(),
+        };
+        Self::new(origin, size)
+    }
 }
 
 impl<T: Clone + Default + Debug + PartialOrd + Add<T, Output = T> + Sub<Output = T>> Bounds<T> {
@@ -2318,6 +2327,18 @@ impl Pixels {
     /// A new `Pixels` instance with the absolute value of the original `Pixels`.
     pub fn abs(&self) -> Self {
         Self(self.0.abs())
+    }
+
+    /// Returns the sign of the `Pixels` value.
+    ///
+    /// # Returns
+    ///
+    /// Returns:
+    /// * `1.0` if the value is positive
+    /// * `-1.0` if the value is negative
+    /// * `0.0` if the value is zero
+    pub fn signum(&self) -> f32 {
+        self.0.signum()
     }
 
     /// Returns the f64 value of `Pixels`.
