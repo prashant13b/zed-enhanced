@@ -1,5 +1,7 @@
 mod connection_pool;
 
+use crate::api::CloudflareIpCountryHeader;
+use crate::llm::LlmTokenClaims;
 use crate::{
     auth,
     db::{
@@ -10,7 +12,7 @@ use crate::{
         ServerId, UpdatedChannelMessage, User, UserId,
     },
     executor::Executor,
-    AppState, Config, Error, RateLimit, RateLimiter, Result,
+    AppState, Config, Error, RateLimit, Result,
 };
 use anyhow::{anyhow, bail, Context as _};
 use async_tungstenite::tungstenite::{
@@ -148,10 +150,12 @@ struct Session {
     db: Arc<tokio::sync::Mutex<DbHandle>>,
     peer: Arc<Peer>,
     connection_pool: Arc<parking_lot::Mutex<ConnectionPool>>,
-    live_kit_client: Option<Arc<dyn live_kit_server::api::Client>>,
+    app_state: Arc<AppState>,
     supermaven_client: Option<Arc<SupermavenAdminApi>>,
     http_client: Arc<IsahcHttpClient>,
-    rate_limiter: Arc<RateLimiter>,
+    /// The GeoIP country code for the user.
+    #[allow(unused)]
+    geoip_country_code: Option<String>,
     _executor: Executor,
 }
 
@@ -196,6 +200,23 @@ impl Session {
             Principal::User(user) => user.admin,
             Principal::Impersonated { .. } => true,
             Principal::DevServer(_) => false,
+        }
+    }
+
+    pub async fn current_plan(&self) -> anyhow::Result<proto::Plan> {
+        if self.is_staff() {
+            return Ok(proto::Plan::ZedPro);
+        }
+
+        let Some(user_id) = self.user_id() else {
+            return Ok(proto::Plan::Free);
+        };
+
+        let db = self.db().await;
+        if db.has_active_billing_subscription(user_id).await? {
+            Ok(proto::Plan::ZedPro)
+        } else {
+            Ok(proto::Plan::Free)
         }
     }
 
@@ -594,6 +615,7 @@ impl Server {
             .add_message_handler(user_message_handler(unfollow))
             .add_message_handler(user_message_handler(update_followers))
             .add_request_handler(user_handler(get_private_user_info))
+            .add_request_handler(user_handler(get_llm_api_token))
             .add_message_handler(user_message_handler(acknowledge_channel_message))
             .add_message_handler(user_message_handler(acknowledge_buffer_version))
             .add_request_handler(user_handler(get_supermaven_api_key))
@@ -967,6 +989,7 @@ impl Server {
         address: String,
         principal: Principal,
         zed_version: ZedVersion,
+        geoip_country_code: Option<String>,
         send_connection_id: Option<oneshot::Sender<ConnectionId>>,
         executor: Executor,
     ) -> impl Future<Output = ()> {
@@ -976,9 +999,13 @@ impl Server {
             user_id=field::Empty,
             login=field::Empty,
             impersonator=field::Empty,
-            dev_server_id=field::Empty
+            dev_server_id=field::Empty,
+            geoip_country_code=field::Empty
         );
         principal.update_span(&span);
+        if let Some(country_code) = geoip_country_code.as_ref() {
+            span.record("geoip_country_code", country_code);
+        }
 
         let mut teardown = self.teardown.subscribe();
         async move {
@@ -993,6 +1020,7 @@ impl Server {
                     move |duration| executor.sleep(duration)
                 });
             tracing::Span::current().record("connection_id", format!("{}", connection_id));
+
             tracing::info!("connection opened");
 
             let user_agent = format!("Zed Server/{}", env!("CARGO_PKG_VERSION"));
@@ -1019,9 +1047,9 @@ impl Server {
                 db: Arc::new(tokio::sync::Mutex::new(DbHandle(this.app_state.db.clone()))),
                 peer: this.peer.clone(),
                 connection_pool: this.connection_pool.clone(),
-                live_kit_client: this.app_state.live_kit_client.clone(),
+                app_state: this.app_state.clone(),
                 http_client,
-                rate_limiter: this.app_state.rate_limiter.clone(),
+                geoip_country_code,
                 _executor: executor.clone(),
                 supermaven_client,
             };
@@ -1378,6 +1406,7 @@ pub async fn handle_websocket_request(
     ConnectInfo(socket_address): ConnectInfo<SocketAddr>,
     Extension(server): Extension<Arc<Server>>,
     Extension(principal): Extension<Principal>,
+    country_code_header: Option<TypedHeader<CloudflareIpCountryHeader>>,
     ws: WebSocketUpgrade,
 ) -> axum::response::Response {
     if protocol_version != rpc::PROTOCOL_VERSION {
@@ -1418,6 +1447,7 @@ pub async fn handle_websocket_request(
                     socket_address,
                     principal,
                     version,
+                    country_code_header.map(|header| header.to_string()),
                     None,
                     Executor::Production,
                 )
@@ -1529,7 +1559,7 @@ async fn create_room(
     let live_kit_room = nanoid::nanoid!(30);
 
     let live_kit_connection_info = util::maybe!(async {
-        let live_kit = session.live_kit_client.as_ref();
+        let live_kit = session.app_state.live_kit_client.as_ref();
         let live_kit = live_kit?;
         let user_id = session.user_id().to_string();
 
@@ -1600,25 +1630,26 @@ async fn join_room(
             .trace_err();
     }
 
-    let live_kit_connection_info = if let Some(live_kit) = session.live_kit_client.as_ref() {
-        if let Some(token) = live_kit
-            .room_token(
-                &joined_room.room.live_kit_room,
-                &session.user_id().to_string(),
-            )
-            .trace_err()
-        {
-            Some(proto::LiveKitConnectionInfo {
-                server_url: live_kit.url().into(),
-                token,
-                can_publish: true,
-            })
+    let live_kit_connection_info =
+        if let Some(live_kit) = session.app_state.live_kit_client.as_ref() {
+            if let Some(token) = live_kit
+                .room_token(
+                    &joined_room.room.live_kit_room,
+                    &session.user_id().to_string(),
+                )
+                .trace_err()
+            {
+                Some(proto::LiveKitConnectionInfo {
+                    server_url: live_kit.url().into(),
+                    token,
+                    can_publish: true,
+                })
+            } else {
+                None
+            }
         } else {
             None
-        }
-    } else {
-        None
-    };
+        };
 
     response.send(proto::JoinRoomResponse {
         room: Some(joined_room.room),
@@ -1847,7 +1878,7 @@ async fn set_room_participant_role(
         (live_kit_room, can_publish)
     };
 
-    if let Some(live_kit) = session.live_kit_client.as_ref() {
+    if let Some(live_kit) = session.app_state.live_kit_client.as_ref() {
         live_kit
             .update_participant(
                 live_kit_room.clone(),
@@ -3537,15 +3568,8 @@ fn should_auto_subscribe_to_channels(version: ZedVersion) -> bool {
     version.0.minor() < 139
 }
 
-async fn update_user_plan(user_id: UserId, session: &Session) -> Result<()> {
-    let db = session.db().await;
-    let active_subscriptions = db.get_active_billing_subscriptions(user_id).await?;
-
-    let plan = if session.is_staff() || !active_subscriptions.is_empty() {
-        proto::Plan::ZedPro
-    } else {
-        proto::Plan::Free
-    };
+async fn update_user_plan(_user_id: UserId, session: &Session) -> Result<()> {
+    let plan = session.current_plan().await?;
 
     session
         .peer
@@ -4025,35 +4049,40 @@ async fn join_channel_internal(
             .join_channel(channel_id, session.user_id(), session.connection_id)
             .await?;
 
-        let live_kit_connection_info = session.live_kit_client.as_ref().and_then(|live_kit| {
-            let (can_publish, token) = if role == ChannelRole::Guest {
-                (
-                    false,
-                    live_kit
-                        .guest_token(
-                            &joined_room.room.live_kit_room,
-                            &session.user_id().to_string(),
+        let live_kit_connection_info =
+            session
+                .app_state
+                .live_kit_client
+                .as_ref()
+                .and_then(|live_kit| {
+                    let (can_publish, token) = if role == ChannelRole::Guest {
+                        (
+                            false,
+                            live_kit
+                                .guest_token(
+                                    &joined_room.room.live_kit_room,
+                                    &session.user_id().to_string(),
+                                )
+                                .trace_err()?,
                         )
-                        .trace_err()?,
-                )
-            } else {
-                (
-                    true,
-                    live_kit
-                        .room_token(
-                            &joined_room.room.live_kit_room,
-                            &session.user_id().to_string(),
+                    } else {
+                        (
+                            true,
+                            live_kit
+                                .room_token(
+                                    &joined_room.room.live_kit_room,
+                                    &session.user_id().to_string(),
+                                )
+                                .trace_err()?,
                         )
-                        .trace_err()?,
-                )
-            };
+                    };
 
-            Some(LiveKitConnectionInfo {
-                server_url: live_kit.url().into(),
-                token,
-                can_publish,
-            })
-        });
+                    Some(LiveKitConnectionInfo {
+                        server_url: live_kit.url().into(),
+                        token,
+                        can_publish,
+                    })
+                });
 
         response.send(proto::JoinRoomResponse {
             room: Some(joined_room.room.clone()),
@@ -4532,22 +4561,41 @@ async fn acknowledge_buffer_version(
     Ok(())
 }
 
-struct CompleteWithLanguageModelRateLimit;
+struct ZedProCompleteWithLanguageModelRateLimit;
 
-impl RateLimit for CompleteWithLanguageModelRateLimit {
-    fn capacity() -> usize {
+impl RateLimit for ZedProCompleteWithLanguageModelRateLimit {
+    fn capacity(&self) -> usize {
         std::env::var("COMPLETE_WITH_LANGUAGE_MODEL_RATE_LIMIT_PER_HOUR")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(120) // Picked arbitrarily
     }
 
-    fn refill_duration() -> chrono::Duration {
+    fn refill_duration(&self) -> chrono::Duration {
         chrono::Duration::hours(1)
     }
 
-    fn db_name() -> &'static str {
-        "complete-with-language-model"
+    fn db_name(&self) -> &'static str {
+        "zed-pro:complete-with-language-model"
+    }
+}
+
+struct FreeCompleteWithLanguageModelRateLimit;
+
+impl RateLimit for FreeCompleteWithLanguageModelRateLimit {
+    fn capacity(&self) -> usize {
+        std::env::var("COMPLETE_WITH_LANGUAGE_MODEL_RATE_LIMIT_PER_HOUR_FREE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(120 / 10) // Picked arbitrarily
+    }
+
+    fn refill_duration(&self) -> chrono::Duration {
+        chrono::Duration::hours(1)
+    }
+
+    fn db_name(&self) -> &'static str {
+        "free:complete-with-language-model"
     }
 }
 
@@ -4562,9 +4610,15 @@ async fn complete_with_language_model(
     };
     authorize_access_to_language_models(&session).await?;
 
+    let rate_limit: Box<dyn RateLimit> = match session.current_plan().await? {
+        proto::Plan::ZedPro => Box::new(ZedProCompleteWithLanguageModelRateLimit),
+        proto::Plan::Free => Box::new(FreeCompleteWithLanguageModelRateLimit),
+    };
+
     session
+        .app_state
         .rate_limiter
-        .check::<CompleteWithLanguageModelRateLimit>(session.user_id())
+        .check(&*rate_limit, session.user_id())
         .await?;
 
     let result = match proto::LanguageModelProvider::from_i32(request.provider) {
@@ -4602,9 +4656,15 @@ async fn stream_complete_with_language_model(
     };
     authorize_access_to_language_models(&session).await?;
 
+    let rate_limit: Box<dyn RateLimit> = match session.current_plan().await? {
+        proto::Plan::ZedPro => Box::new(ZedProCompleteWithLanguageModelRateLimit),
+        proto::Plan::Free => Box::new(FreeCompleteWithLanguageModelRateLimit),
+    };
+
     session
+        .app_state
         .rate_limiter
-        .check::<CompleteWithLanguageModelRateLimit>(session.user_id())
+        .check(&*rate_limit, session.user_id())
         .await?;
 
     match proto::LanguageModelProvider::from_i32(request.provider) {
@@ -4667,6 +4727,30 @@ async fn stream_complete_with_language_model(
                 })?;
             }
         }
+        Some(proto::LanguageModelProvider::Zed) => {
+            let api_key = config
+                .qwen2_7b_api_key
+                .as_ref()
+                .context("no Qwen2-7B API key configured on the server")?;
+            let api_url = config
+                .qwen2_7b_api_url
+                .as_ref()
+                .context("no Qwen2-7B URL configured on the server")?;
+            let mut events = open_ai::stream_completion(
+                session.http_client.as_ref(),
+                &api_url,
+                api_key,
+                serde_json::from_str(&request.request)?,
+                None,
+            )
+            .await?;
+            while let Some(event) = events.next().await {
+                let event = event?;
+                response.send(proto::StreamCompleteWithLanguageModelResponse {
+                    event: serde_json::to_string(&event)?,
+                })?;
+            }
+        }
         None => return Err(anyhow!("unknown provider"))?,
     }
 
@@ -4684,9 +4768,15 @@ async fn count_language_model_tokens(
     };
     authorize_access_to_language_models(&session).await?;
 
+    let rate_limit: Box<dyn RateLimit> = match session.current_plan().await? {
+        proto::Plan::ZedPro => Box::new(ZedProCountLanguageModelTokensRateLimit),
+        proto::Plan::Free => Box::new(FreeCountLanguageModelTokensRateLimit),
+    };
+
     session
+        .app_state
         .rate_limiter
-        .check::<CountLanguageModelTokensRateLimit>(session.user_id())
+        .check(&*rate_limit, session.user_id())
         .await?;
 
     let result = match proto::LanguageModelProvider::from_i32(request.provider) {
@@ -4713,41 +4803,79 @@ async fn count_language_model_tokens(
     Ok(())
 }
 
-struct CountLanguageModelTokensRateLimit;
+struct ZedProCountLanguageModelTokensRateLimit;
 
-impl RateLimit for CountLanguageModelTokensRateLimit {
-    fn capacity() -> usize {
+impl RateLimit for ZedProCountLanguageModelTokensRateLimit {
+    fn capacity(&self) -> usize {
         std::env::var("COUNT_LANGUAGE_MODEL_TOKENS_RATE_LIMIT_PER_HOUR")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(600) // Picked arbitrarily
     }
 
-    fn refill_duration() -> chrono::Duration {
+    fn refill_duration(&self) -> chrono::Duration {
         chrono::Duration::hours(1)
     }
 
-    fn db_name() -> &'static str {
-        "count-language-model-tokens"
+    fn db_name(&self) -> &'static str {
+        "zed-pro:count-language-model-tokens"
     }
 }
 
-struct ComputeEmbeddingsRateLimit;
+struct FreeCountLanguageModelTokensRateLimit;
 
-impl RateLimit for ComputeEmbeddingsRateLimit {
-    fn capacity() -> usize {
+impl RateLimit for FreeCountLanguageModelTokensRateLimit {
+    fn capacity(&self) -> usize {
+        std::env::var("COUNT_LANGUAGE_MODEL_TOKENS_RATE_LIMIT_PER_HOUR_FREE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(600 / 10) // Picked arbitrarily
+    }
+
+    fn refill_duration(&self) -> chrono::Duration {
+        chrono::Duration::hours(1)
+    }
+
+    fn db_name(&self) -> &'static str {
+        "free:count-language-model-tokens"
+    }
+}
+
+struct ZedProComputeEmbeddingsRateLimit;
+
+impl RateLimit for ZedProComputeEmbeddingsRateLimit {
+    fn capacity(&self) -> usize {
         std::env::var("EMBED_TEXTS_RATE_LIMIT_PER_HOUR")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(5000) // Picked arbitrarily
     }
 
-    fn refill_duration() -> chrono::Duration {
+    fn refill_duration(&self) -> chrono::Duration {
         chrono::Duration::hours(1)
     }
 
-    fn db_name() -> &'static str {
-        "compute-embeddings"
+    fn db_name(&self) -> &'static str {
+        "zed-pro:compute-embeddings"
+    }
+}
+
+struct FreeComputeEmbeddingsRateLimit;
+
+impl RateLimit for FreeComputeEmbeddingsRateLimit {
+    fn capacity(&self) -> usize {
+        std::env::var("EMBED_TEXTS_RATE_LIMIT_PER_HOUR_FREE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(5000 / 10) // Picked arbitrarily
+    }
+
+    fn refill_duration(&self) -> chrono::Duration {
+        chrono::Duration::hours(1)
+    }
+
+    fn db_name(&self) -> &'static str {
+        "free:compute-embeddings"
     }
 }
 
@@ -4760,9 +4888,15 @@ async fn compute_embeddings(
     let api_key = api_key.context("no OpenAI API key configured on the server")?;
     authorize_access_to_language_models(&session).await?;
 
+    let rate_limit: Box<dyn RateLimit> = match session.current_plan().await? {
+        proto::Plan::ZedPro => Box::new(ZedProComputeEmbeddingsRateLimit),
+        proto::Plan::Free => Box::new(FreeComputeEmbeddingsRateLimit),
+    };
+
     session
+        .app_state
         .rate_limiter
-        .check::<ComputeEmbeddingsRateLimit>(session.user_id())
+        .check(&*rate_limit, session.user_id())
         .await?;
 
     let embeddings = match request.model.as_str() {
@@ -4834,10 +4968,10 @@ async fn authorize_access_to_language_models(session: &UserSession) -> Result<()
     let db = session.db().await;
     let flags = db.get_user_flags(session.user_id()).await?;
     if flags.iter().any(|flag| flag == "language-models") {
-        Ok(())
-    } else {
-        Err(anyhow!("permission denied"))?
+        return Ok(());
     }
+
+    Err(anyhow!("permission denied"))?
 }
 
 /// Get a Supermaven API key for the user
@@ -5016,6 +5150,25 @@ async fn get_private_user_info(
         staff: user.admin,
         flags,
     })?;
+    Ok(())
+}
+
+async fn get_llm_api_token(
+    _request: proto::GetLlmToken,
+    response: Response<proto::GetLlmToken>,
+    session: UserSession,
+) -> Result<()> {
+    if !session.is_staff() {
+        Err(anyhow!("permission denied"))?
+    }
+
+    let token = LlmTokenClaims::create(
+        session.user_id(),
+        session.is_staff(),
+        session.current_plan().await?,
+        &session.app_state.config,
+    )?;
+    response.send(proto::GetLlmTokenResponse { token })?;
     Ok(())
 }
 
@@ -5362,7 +5515,7 @@ async fn leave_room_for_session(session: &UserSession, connection_id: Connection
         update_user_contacts(contact_user_id, &session).await?;
     }
 
-    if let Some(live_kit) = session.live_kit_client.as_ref() {
+    if let Some(live_kit) = session.app_state.live_kit_client.as_ref() {
         live_kit
             .remove_participant(live_kit_room.clone(), session.user_id().to_string())
             .await

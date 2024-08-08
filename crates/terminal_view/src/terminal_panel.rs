@@ -173,7 +173,10 @@ impl TerminalPanel {
         let additional_buttons = self.additional_tab_bar_buttons.clone();
         self.pane.update(cx, |pane, cx| {
             pane.set_render_tab_bar_buttons(cx, move |pane, cx| {
-                h_flex()
+                if !pane.has_focus(cx) {
+                    return (None, None);
+                }
+                let right_children = h_flex()
                     .gap_2()
                     .children(additional_buttons.clone())
                     .child(
@@ -229,6 +232,8 @@ impl TerminalPanel {
                             })
                     })
                     .into_any_element()
+                    .into();
+                (None, right_children)
             });
         });
     }
@@ -342,7 +347,7 @@ impl TerminalPanel {
     ) {
         match event {
             pane::Event::ActivateItem { .. } => self.serialize(cx),
-            pane::Event::RemoveItem { .. } => self.serialize(cx),
+            pane::Event::RemovedItem { .. } => self.serialize(cx),
             pane::Event::Remove => cx.emit(PanelEvent::Close),
             pane::Event::ZoomIn => cx.emit(PanelEvent::ZoomIn),
             pane::Event::ZoomOut => cx.emit(PanelEvent::ZoomOut),
